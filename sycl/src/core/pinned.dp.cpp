@@ -25,6 +25,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <dxgi1_2.h>
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -312,6 +313,34 @@ int arena_pin_cap_gib() {
 
 namespace {
 #ifdef _WIN32
+// The pinned device's LUID, which gpu_shared_memory_budget needs: Level Zero exposes no LUID, so the
+// SYCL device name is matched against the DXGI adapter descriptions (the Intel driver reports both
+// verbatim, e.g. "Intel(R) Arc(TM) B580 Graphics").
+bool current_device_luid(LUID& out) {
+    const std::string name = dpct::get_in_order_queue().get_device().get_info<sycl::info::device::name>();
+    const int wlen = MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, nullptr, 0);
+    if (wlen <= 1 || wlen > 255) return false;
+    wchar_t wname[256] = {};
+    MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, wname, wlen);
+    HMODULE dxgi = LoadLibraryA("dxgi.dll");
+    if (dxgi == nullptr) return false;
+    using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+    const auto create = (CreateFactory) (void*) GetProcAddress(dxgi, "CreateDXGIFactory1");
+    IDXGIFactory1* factory = nullptr;
+    bool ok = false;
+    if (create != nullptr && SUCCEEDED(create(__uuidof(IDXGIFactory1), (void**) &factory)) && factory != nullptr) {
+        for (UINT i = 0; !ok; ++i) {
+            IDXGIAdapter1* a = nullptr;
+            if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND || a == nullptr) break;
+            DXGI_ADAPTER_DESC1 d{};
+            if (SUCCEEDED(a->GetDesc1(&d)) && lstrcmpW(d.Description, wname) == 0) { out = d.AdapterLuid; ok = true; }
+            a->Release();
+        }
+        factory->Release();
+    }
+    FreeLibrary(dxgi);
+    return ok;
+}
 // #243: how much of the arena the sliced registration may pin on Windows when the whole arena was refused.
 // Page-locked memory the GPU maps is charged to its shared (non-local) WDDM segment; pinned slice by slice until
 // the driver refused one (28 GiB of a 63 GB PC), that segment was left full and every later cudaMalloc failed
@@ -320,19 +349,16 @@ namespace {
 bool sliced_pin_limit(uint64_t& limit, std::string& why) {
     constexpr uint64_t GiB = 1ull << 30;
     char buf[256];
-    int dev = 0;
-    cudaDeviceProp p{};
     uint64_t budget = 0, usage = 0;
-    std::string err = "no CUDA device properties";
-    if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-        strata::platform::gpu_shared_memory_budget(p.luid, budget, usage, err)) {
+    std::string err = "no DXGI adapter matches the SYCL device";
+    LUID luid{};
+    if (current_device_luid(luid) && strata::platform::gpu_shared_memory_budget(&luid, budget, usage, err)) {
         limit = budget > usage + 4 * GiB ? budget - usage - 4 * GiB : 0;
         std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget %.1f GiB - %.1f GiB in use - 4 GiB",
                       (double) budget / GiB, (double) usage / GiB);
         why = buf;
         return true;
     }
-    (void) cudaGetLastError();
     const uint64_t ram = strata::platform::total_physical_memory();
     if (ram == 0) return false;
     limit = ram / 2 > 8 * GiB ? ram / 2 - 8 * GiB : 0;
