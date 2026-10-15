@@ -126,7 +126,33 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include <set>
 #include <vector>
 
+#if defined(_WIN32)
+// The Windows SDK's rpcndr.h defines small/medium/large as macros; this file uses those words as
+// identifiers (no RPC types are used here), so undefine them for this translation unit.
+#ifdef small
+#undef small
+#endif
+#ifdef medium
+#undef medium
+#endif
+#ifdef large
+#undef large
+#endif
+#endif
+
 namespace {
+#if defined(_WIN32)
+// glibc's memmem (find a byte substring in a byte range); MSVC has no memmem. Used by the verify trace.
+const void* memmem(const void* hay, size_t hay_len, const void* needle, size_t needle_len) {
+    if (needle_len == 0) return hay;
+    if (hay_len < needle_len) return nullptr;
+    const uint8_t* h = (const uint8_t*) hay;
+    const uint8_t* n = (const uint8_t*) needle;
+    for (size_t i = 0; i + needle_len <= hay_len; ++i)
+        if (std::memcmp(h + i, n, needle_len) == 0) return h + i;
+    return nullptr;
+}
+#endif
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
 // a Linux driver has no such limit (#253: the 8 GiB cap cost a 4090 + 3060 split 3x of its prompt speed).
