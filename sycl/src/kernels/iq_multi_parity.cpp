@@ -108,6 +108,7 @@ std::vector<double> dequant_q8_1(const std::vector<uint8_t>& q, size_t n) {
 }
 
 #include "iq2xs_host_tables.inc"
+#include "strata/win_macros.hpp"
 // IQ2_XS decoded on the CPU from ggml's tables (dequantize_row_iq2_xs), a reference independent of the GPU dequantizer
 std::vector<float> host_iq2_xs(const std::vector<uint8_t>& w, size_t n) {
     std::vector<float> y(n);

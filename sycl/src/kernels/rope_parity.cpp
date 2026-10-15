@@ -39,6 +39,8 @@
 #include <string>
 #include <vector>
 
+#include "strata/win_macros.hpp"
+
 namespace {
 
 void check(dpct::err0 e, const char *what) {
