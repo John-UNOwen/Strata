@@ -78,8 +78,16 @@ endif()
 list(APPEND _sycl_flags -fsycl-default-sub-group-size=32)
 # One device module per kernel: the first launch of a kernel then loads only its own module. With the default
 # split the first launch in the prompt path (the embedding gather) paid 245 ms for the image it shared (2026-09-30).
-list(APPEND _sycl_link -fsycl-device-code-split=per_kernel)
-list(APPEND _sycl_flags -fsycl-device-code-split=per_kernel)
+# Windows: sycl-post-link is single-threaded and cannot merge the per-kernel module set of this engine: 41 min of
+# post-link and a merged wrapper image big enough that the wrapping pass failed with "not enough memory"
+# (2026-10-15). One module per TU keeps the Windows link tractable; the 245 ms observation is a Linux cost.
+if(WIN32)
+  list(APPEND _sycl_link -fsycl-device-code-split=off)
+  list(APPEND _sycl_flags -fsycl-device-code-split=off)
+else()
+  list(APPEND _sycl_link -fsycl-device-code-split=per_kernel)
+  list(APPEND _sycl_flags -fsycl-device-code-split=per_kernel)
+endif()
 add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${_sycl_flags}>" -fp-model=precise -Wno-unused-parameter
                     -Wno-unused-variable -Wno-deprecated-declarations)
 add_link_options(${_sycl_link})
@@ -244,6 +252,13 @@ add_library(strata_prefill STATIC ${_prefill}
             ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/xmx_moe.dp.cpp)      # A770 port: grouped XMX expert GEMM
 target_compile_options(strata_prefill PUBLIC -qmkl=sequential)
 target_link_options(strata_prefill PUBLIC -qmkl=sequential)
+if(WIN32)
+  # Windows: -qmkl links the classic BLAS import libs only. The dpct::blas port calls the SYCL
+  # oneapi::mkl::blas::gemm templates (10 instantiations in gemm.dp.cpp), which live in
+  # mkl_sycl_blas_dll.lib; link it so strata.exe links.
+  find_library(STRATA_MKL_SYCL_BLAS_LIB mkl_sycl_blas_dll HINTS "$ENV{MKLROOT}/lib" REQUIRED)
+  target_link_libraries(strata_prefill PUBLIC ${STRATA_MKL_SYCL_BLAS_LIB})
+endif()
 target_link_libraries(strata_prefill PUBLIC strata_engine)
 
 strata_resolve(_main src/program/generate.cpp)
