@@ -24,6 +24,23 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+// rpcndr.h (in the SDK chain the Windows dpct headers pull in) defines OUT as a macro; this file
+// uses OUT as a kernel template parameter, so undefine it for this translation unit.
+#ifdef OUT
+#undef OUT
+#endif
+#ifdef small
+#undef small
+#endif
+#ifdef medium
+#undef medium
+#endif
+#ifdef large
+#undef large
+#endif
+#endif
+
 #ifndef STRATA_PLAN_LOCAL
 #define STRATA_PLAN_LOCAL 1   // 0: the original one-thread plan kernel (A/B)
 #endif
