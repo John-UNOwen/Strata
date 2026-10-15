@@ -84,7 +84,7 @@ bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t
         for (int r = 0; r < 3; ++r)
             if (fd_of(l, r, err) < 0) { close(); return false; }
     ring_.resize(kRing);
-    for (auto& b : ring_) b.resize((size_t) lay.max_blob);
+    for (auto& b : ring_) b.resize((size_t) lay.max_blob + 4096);   // tail slack: the host gemv reads past the last block (windows page-tight blocks)
     ring_key_.assign(kRing, -1);
     return true;
 }
@@ -183,7 +183,7 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
             const uint64_t want = std::max(b, std::min<uint64_t>(kChunk, total - placed));
             uint8_t* nc = nullptr;
             try {
-                nc = (uint8_t*) sycl::malloc_host((size_t) want, dpct::get_in_order_queue());
+                nc = (uint8_t*) sycl::malloc_host((size_t) want + 4096, dpct::get_in_order_queue());   // +4 KiB past the last blob: same read-ahead slack; cur_size stays 'want' so placement is unchanged
             } catch (const sycl::exception& ex) {
                 err = std::string("mirror: ") + ex.what();
             }

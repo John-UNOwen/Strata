@@ -88,9 +88,9 @@ bool mapped(size_t bytes, void **h, void **d) try {
     migrated code.
     */
     if (DPCT_CHECK_ERROR(*h = strata::host_malloc_polled(
-                             bytes, dpct::get_in_order_queue())) !=
-        0 || *h == nullptr) return false;   // the host polls what the draft steps write: uncached host memory (sycl_queue.hpp)
-    std::memset(*h, 0, bytes);
+                             bytes + 4096, dpct::get_in_order_queue())) !=
+        0 || *h == nullptr) return false;   // the host polls what the draft steps write: uncached host memory (sycl_queue.hpp); + slack for their read-ahead (windows page-tight allocations)
+    std::memset(*h, 0, bytes + 4096);
     return DPCT_CHECK_ERROR(*d = (void *)*h) == 0;
 }
 catch (sycl::exception const &exc) {

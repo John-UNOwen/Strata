@@ -1859,8 +1859,8 @@ bool FileExpertSource::pin_cache_complement(
         std::fflush(stderr);
         if (pin) {
             const dpct::err0 allocated = DPCT_CHECK_ERROR(
-                arena = (void *)sycl::malloc_host((size_t)bytes,
-                                                  dpct::get_in_order_queue()));
+                arena = (void *)sycl::malloc_host((size_t)bytes + 4096,
+                                                  dpct::get_in_order_queue()));   // tail slack past the last complement blob (windows page-tight USM)
             if (allocated == 0) {
                 void* alias = nullptr;
                 const dpct::err0 aliased =

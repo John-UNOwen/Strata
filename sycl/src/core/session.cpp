@@ -760,11 +760,11 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string &err) try {
     the migrated code.
     */
     if (DPCT_CHECK_ERROR(y_miss = (float *)strata::host_malloc_polled(
-                             parts_bytes, dpct::get_in_order_queue())) != 0 || y_miss == nullptr) {
+                             parts_bytes + 4096, dpct::get_in_order_queue())) != 0 || y_miss == nullptr) {   // tail slack: the pool's kernels read past the last row on a page-tight Windows allocation
         err = "SessionLoopScratch: cudaHostAlloc for the pool's staging failed";
         return false;
     }
-    std::memset(y_miss, 0, parts_bytes);
+    std::memset(y_miss, 0, parts_bytes + 4096);
     if (DPCT_CHECK_ERROR(probe = new sycl::event()) != 0) {
         err = "SessionLoopScratch: cudaEventCreate failed";
         free();

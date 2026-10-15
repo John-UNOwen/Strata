@@ -234,10 +234,14 @@ bool mapped(size_t bytes, void **h, void **d) try {
     */
     // polled by the window's kernels: uncached host memory (sycl_queue.hpp); a buffer only read or written between
     // kernels (the stepped window's payload) is ordinary host USM
-    if (DPCT_CHECK_ERROR(*h = window_host_uncached() ? strata::host_malloc_polled(bytes, dpct::get_in_order_queue())
-                                     : sycl::malloc_host(bytes, dpct::get_in_order_queue())) !=
+    // windows port 2026-10-15: the allocation carries 4 KiB of tail slack. The host's reference gemv loads whole
+    // 8/16-byte groups a little past the last quantized block; a Linux registered/mmap region absorbs that
+    // read-ahead, a Windows polled allocation maps exactly to page granularity and the last group hits a guard page.
+    const size_t mapped_bytes = bytes + 4096;
+    if (DPCT_CHECK_ERROR(*h = window_host_uncached() ? strata::host_malloc_polled(mapped_bytes, dpct::get_in_order_queue())
+                                     : sycl::malloc_host(mapped_bytes, dpct::get_in_order_queue())) !=
         0 || *h == nullptr) return false;
-    std::memset(*h, 0, bytes);
+    std::memset(*h, 0, mapped_bytes);
     return DPCT_CHECK_ERROR(*d = (void *)*h) == 0;
 }
 catch (sycl::exception const &exc) {
