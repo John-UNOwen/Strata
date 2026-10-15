@@ -88,7 +88,15 @@ else()
   list(APPEND _sycl_link -fsycl-device-code-split=per_kernel)
   list(APPEND _sycl_flags -fsycl-device-code-split=per_kernel)
 endif()
-add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${_sycl_flags}>" -fp-model=precise -Wno-unused-parameter
+# the host-side precision spelling is driver-specific: clang-cl silently drops '-fp-model=precise'
+# ("unknown argument ignored in clang-cl"), so the replay halves of the parity tests compiled without
+# the precise semantics the kernel contracts pin; on Windows the same setting is '/fp:precise' (port note).
+if(WIN32)
+  set(_fp_precise "/fp:precise")
+else()
+  set(_fp_precise "-fp-model=precise")
+endif()
+add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${_sycl_flags}>" ${_fp_precise} -Wno-unused-parameter
                     -Wno-unused-variable -Wno-deprecated-declarations)
 add_link_options(${_sycl_link})
 
