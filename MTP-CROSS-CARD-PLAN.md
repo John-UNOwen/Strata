@@ -1,5 +1,11 @@
 # MTP across both Arcs on Windows SYCL: workflow (2026-10-16)
 
+> **PARKED / SUPERSEDED (2026-10-16).** Cross-card MTP is parked: see the knowledge base decision
+> `projects/strata-windows-sycl/decisions/park-cross-card-mtp-unless-it-beats-18-24.md`. The split11 NaN is
+> settled as two faults (staging-scratch race, fixed in 9953a5b; >4 GiB A770 layout at 64K, open):
+> `references/split11-nan-story-2026-10-16.md`. Kept as history.
+
+
 Goal: speculative decoding (MTP drafter + verifier) with the k22 split (B580 layers 0-21,
 A770 layers 22-47) and no DEVICE_LOST. Reference: MTP gave Qwen3.8-27B +47% decode on this box.
 Background: `HANDOFF-WINDOWS-SYCL.md`, `bench/results/STATUS-2026-10-16.md`.
