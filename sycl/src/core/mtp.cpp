@@ -1377,6 +1377,21 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         return false;
 #endif
     }();
+    // STRATA_MTP_NO_GRAPH=1: run the prefill forward as ordinary kernel submissions instead of graph replay.
+    // Diagnostic for the two-card warmup hang: if the eager path survives where the graph dies, the fault is
+    // the driver's graph replay on this split, not the kernels' data.
+    static const bool no_graph = [] {
+        const char* v = std::getenv("STRATA_MTP_NO_GRAPH");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    auto eager_forward = [&](int T, const bool dev_inputs) -> bool {
+        if (!dev_inputs) {
+            strata::kernels::copy_i32_from_mapped(tok_, m_tok_, T, cs_);
+            strata::kernels::copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
+            strata::kernels::copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * g_->n_head, cs_);
+        }
+        return record_forward(T, -1, cs_, err);
+    };
     const int64_t NHp = g_->n_head, per_row = 1 + 4 + NHp;
     if (!per_group_sync && n > 0) {
         if (pf_cap_ < n * per_row) {
@@ -1423,7 +1438,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         for (int64_t c = 0; c < n; c += max_t_) {
             const int T = (int) std::min<int64_t>(max_t_, n - c);
             if (cell0 + c + T <= first_needed) continue;
-            if (!capture_prefill_dev(T, err)) return false;
+            if (!no_graph && !capture_prefill_dev(T, err)) return false;
             if (staged_prev) {   // the previous group's host-staged rows must be fully read before reuse
                 if (DPCT_CHECK_ERROR(cs_->wait()) != 0) {
                     err = "mtp prefill: the staged rows sync failed";
@@ -1476,8 +1491,9 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
                 DPCT_CHECK_ERROR(
                     cs_->memcpy(Rin_, rows_src,
                                 (size_t)T * HCN * sizeof(float))) != 0 ||
-                DPCT_CHECK_ERROR(
-                    (cs_)->ext_oneapi_graph(*prefill_dev_exec_[T])) != 0) {
+                (no_graph ? (!eager_forward(T, true))
+                          : (DPCT_CHECK_ERROR(
+                                (cs_)->ext_oneapi_graph(*prefill_dev_exec_[T])) != 0))) {
                 /*
                 DPCT1009: SYCL reports errors using exceptions and does not
                 use error codes. Please replace the
@@ -1521,7 +1537,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     for (int64_t c = 0; c < n; c += max_t_) {
         const int T = (int) std::min<int64_t>(max_t_, n - c);
         if (cell0 + c + T <= first_needed) continue;
-        if (!capture_prefill(T, err)) return false;
+        if (!no_graph && !capture_prefill(T, err)) return false;
         // Rows from the other card's arena: staged like the E-4 pass above (cross_usm_probe T9a/T10).
         // This loop syncs cs_ at the end of every group, so the staging buffer is never rewritten mid-copy.
         const float* rows_src = R_rows + (size_t)c * HCN;
@@ -1549,7 +1565,8 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         if (DPCT_CHECK_ERROR(cs_->memcpy(Rin_, rows_src,
                                          (size_t)T * HCN * sizeof(float))) !=
                 0 ||
-            DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*prefill_exec_[T])) != 0 ||
+            (no_graph ? (!eager_forward(T, false))
+                      : (DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*prefill_exec_[T])) != 0)) ||
             DPCT_CHECK_ERROR(cs_->wait()) != 0) {
             /*
             DPCT1009: SYCL reports errors using exceptions and does not use
