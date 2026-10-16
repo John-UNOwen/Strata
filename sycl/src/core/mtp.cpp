@@ -492,6 +492,9 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
 #if !defined(STRATA_USE_HIP)   // (HIP: the default priority)
     static const bool hi_prio = [] { const char* v = std::getenv("STRATA_MTP_PRIORITY"); return v == nullptr || std::atoi(v) != 0; }();
     int prio_lo = 0, prio_hi = 0;
+    // The private queues are created on the drafter's own device_ext context, whatever OnDevice the caller
+    // had active at this point in load().
+    const OnDevice queues_device(device_);
     /*
     DPCT1027: The call to cudaDeviceGetStreamPriorityRange was replaced with
     0 because SYCL currently does not support get queue priority range.
@@ -531,10 +534,11 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
             return false;
         }
     }
-    std::fprintf(stderr, "strata mtp: side branch queue: %s (cs_: %s; same context: %s)\n",
+    std::fprintf(stderr, "strata mtp: side branch queue: %s (cs_: %s; same context: %s; cs_ in drafter device_ext context: %s)\n",
                  side_->get_device().get_info<sycl::info::device::name>().c_str(),
                  cs_->get_device().get_info<sycl::info::device::name>().c_str(),
-                 side_->get_context() == cs_->get_context() ? "yes" : "NO");
+                 side_->get_context() == cs_->get_context() ? "yes" : "NO",
+                 cs_->get_context() == dpct::get_current_device().get_context() ? "yes" : "NO");
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     if (shared != nullptr) {
         std::fprintf(stderr, "strata mtp: shared draft weights, %.0f MiB of private state and buffers\n",
@@ -836,6 +840,7 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
         if (!we) { err = "mtp: token_embd.weight is missing"; return false; }
         strata::mtp_ctx_check("record_front token_embd", we->data, *cs);
         if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
+            strata::mtp_ctx_check("record_front embed table", ne->table(), *strata::q_of(cs));
             ne->gather_dev(tok_, T, emb_, cs);
         } else {
             const auto* codes = (const uint8_t*) we->data;
