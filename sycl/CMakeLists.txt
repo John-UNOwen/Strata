@@ -272,7 +272,9 @@ target_link_libraries(strata_prefill PUBLIC strata_engine)
 strata_resolve(_main src/program/generate.cpp)
 add_executable(strata ${_main})
 target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
-target_link_options(strata PRIVATE "LINKER:/MAP")   # debug session 2026-10-15: a strata.map next to the exe for fault triage
+if(WIN32)
+  target_link_options(strata PRIVATE "LINKER:/MAP")   # debug session 2026-10-15: a strata.map next to the exe for fault triage
+endif()
 
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
 option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)
