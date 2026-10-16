@@ -7068,6 +7068,14 @@ int main(int argc, char **argv) try {
             std::vector<std::pair<strata::prefill::Prefill*, int>> paths{{&sp, 0}};
             for (const auto& st : stages) paths.emplace_back(&st->sp, st->dev);
             for (size_t i = 0; i < paths.size(); ++i) {
+                // Windows, the two cards in different SYCL contexts: the helper's rows are mapped host memory both cards
+                // read in place (strata::cross_context) - the stage reads its prompts alone
+                const int helper_dev = paths[(i + 1) % paths.size()].second;
+                if (strata::cross_context(helper_dev, paths[i].second)) {
+                    std::fprintf(stderr, "strata serve: stage %zu reads its prompts alone (its helper, CUDA%d, is in another "
+                                         "SYCL context)\n", i, helper_dev);
+                    continue;
+                }
                 const strata::core::OnDevice on(paths[i].second);
                 if (!paths[i].first->set_stage_helper(paths[(i + 1) % paths.size()].first, err)) {
                     std::fprintf(stderr, "strata serve: %s - stage %zu reads its prompts alone\n", err.c_str(), i);
@@ -7160,6 +7168,29 @@ int main(int argc, char **argv) try {
         // for the odd ones, sharing one stream of their card, and a hand-off per parity - so stage 0 can run window
         // K+1 while stage 1 still reads window K's hand-off
         const bool pipe = o.pipeline_windows > 0 && n_stages == 2 && !split_same && stages.size() == 1;
+        // the device a stage runs on (stage 0: CUDA0; --split-device 0: every stage on CUDA0)
+        auto split_stage_dev = [&](int st) { return st == 0 || split_same ? 0 : stages[(size_t) st - 1]->dev; };
+        // Windows, a later stage on a card in another SYCL context than CUDA0 (strata::cross_context): its GPU must not
+        // read the host-side experts in place (the pool's PCIe share), since they were allocated through CUDA0 - the CPU
+        // computes that stage's misses instead.  STRATA_SPLIT_PCIE_FOREIGN=1 keeps the reads (for testing).
+        auto stage_reads_host = [&](int st) {
+            static const bool keep = [] { const char* e = std::getenv("STRATA_SPLIT_PCIE_FOREIGN"); return e && e[0] == '1'; }();
+            return keep || !strata::cross_context(split_stage_dev(st), 0);
+        };
+        {
+            bool cross = false;
+            for (int st = 1; st < n_stages; ++st) cross = cross || strata::cross_context(split_stage_dev(st), split_stage_dev(st - 1));
+            if (cross && (pipe || (o.batch > 0 && o.batch_groups > 1))) {
+                std::fprintf(stderr, "strata serve: --pipeline-windows and --batch-groups drive the stages' hand-offs from the "
+                                     "caller, which a split across SYCL contexts (two cards on Windows) does not support yet; "
+                                     "run without them\n");
+                return 2;
+            }
+            for (int st = 1; st < n_stages; ++st)
+                if (!stage_reads_host(st))
+                    std::fprintf(stderr, "strata serve: layer split: CUDA%d is in another SYCL context than CUDA0; its stage "
+                                         "reads no experts over PCIe (the CPU computes its misses)\n", split_stage_dev(st));
+        }
         strata::core::Verifier ver_b;
         SplitDrive split_drive_b;
         dpct::queue_ptr pl_stream[2] = {&dpct::get_in_order_queue(),
@@ -7199,7 +7230,27 @@ int main(int argc, char **argv) try {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
+            // Windows, cards in different contexts (strata::cross_context): each side of a hand-off gets its own buffer,
+            // allocated through its own card, and the host copies the rows across between the stages (set_handoff_copy).
+            // Elsewhere one shared buffer, as before.
+            std::vector<float*> hand_in((size_t) n_stages - 1, nullptr);
+            for (size_t b = 0; b < hand.size(); ++b) {
+                const int dw = split_stage_dev((int) b), dr = split_stage_dev((int) b + 1);
+                if (!strata::cross_context(dr, dw)) continue;
+                for (const auto& [dev, slot] : {std::pair<int, float**>{dw, &hand[b]}, std::pair<int, float**>{dr, &hand_in[b]}}) {
+                    const strata::core::OnDevice on(dev);
+                    *slot = (float *)sycl::malloc_host(hb, dpct::get_in_order_queue());
+                    if (*slot == nullptr) {
+                        std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
+                        return 1;
+                    }
+                    std::memset(*slot, 0, hb);
+                }
+                std::fprintf(stderr, "strata serve: layer split: CUDA%d and CUDA%d are in different SYCL contexts; the "
+                                     "hand-off rows are copied between their own buffers on the host\n", dw, dr);
+            }
             for (float*& h : hand) {
+                if (h != nullptr) continue;   // a cross-context boundary's, allocated above
                 float* hh = nullptr;
                 /*
                 DPCT1048: The original value cudaHostAllocMapped is not
@@ -7220,11 +7271,15 @@ int main(int argc, char **argv) try {
                 }
                 std::memset(hh, 0, hb);
             }
+            for (size_t b = 0; b < hand.size(); ++b)
+                if (hand_in[b] == nullptr) hand_in[b] = hand[b];
             split_drive.base = &drive;
             split_drive.n = n_stages;
             for (int st = 0; st < n_stages; ++st) {
                 stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
-                                        st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
+                                        st == 0 ? nullptr : hand_in[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
+                if (st + 1 < n_stages && hand_in[(size_t) st] != hand[(size_t) st])
+                    stage_ver(st).set_handoff_copy(hand_in[(size_t) st], hb);
                 split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
@@ -7248,7 +7303,7 @@ int main(int argc, char **argv) try {
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max(o.spec, o.batch), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
-                    split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
+                    split_drive.pcie_num[st] = stage_reads_host(st) ? pcie_num_of(gs.pcie_frac) : 0;
                 }
                 if (!ok_s) {
                     std::fprintf(stderr, "strata serve: layer split, stage %d: %s\n", st + 1, err.c_str());
@@ -10496,7 +10551,8 @@ int main(int argc, char **argv) try {
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
-                split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
+                split_drive.pcie_num[st] = !stage_reads_host(st) ? 0
+                                           : (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
             if (pipe) for (int st = 0; st < split_drive.n; ++st) split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);

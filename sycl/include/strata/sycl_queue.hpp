@@ -173,6 +173,26 @@ inline IntelGpuGen intel_gpu_gen_of(const sycl::device& d) {
     cache.emplace(d, g);
     return g;
 }
+
+// Layer split on Windows: is host USM allocated through device `owner`'s queue unsafe for a KERNEL on device `dev`?
+// Under UR on Windows every GPU is its own platform, so dpct gives each its own context, and a context cannot hold
+// devices of two platforms.  A kernel that reads another context's host USM in place gets wrong data with no error
+// (B580 + A770: 4,095 of 4,096 values wrong); a memcpy from it is right (HANDOFF section 16, probes T3 / T5).  On
+// Linux the in-place read works, and the split keeps its in-place hand-offs.  STRATA_SPLIT_CROSS_CONTEXT=1 treats any
+// two devices as unsafe, =0 none.
+inline bool cross_context(int dev, int owner) {
+    static const int env = [] {
+        const char* e = std::getenv("STRATA_SPLIT_CROSS_CONTEXT");
+        return e && *e ? (e[0] == '1' ? 1 : 0) : -1;
+    }();
+    if (dev == owner || dev < 0 || owner < 0) return false;
+    if (env >= 0) return env == 1;
+#if defined(_WIN32)
+    return dpct::get_device((unsigned) dev).get_context() != dpct::get_device((unsigned) owner).get_context();
+#else
+    return false;
+#endif
+}
 }  // namespace strata
 
 #include <cstdint>

@@ -2414,6 +2414,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
+        forward_handoff();
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
@@ -2456,6 +2457,11 @@ catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
+}
+
+void Verifier::forward_handoff() const {
+    if (hand_copy_ != nullptr && hand_out_ != nullptr && hand_copy_bytes_ > 0)
+        std::memcpy(hand_copy_, hand_out_, hand_copy_bytes_);
 }
 
 void Verifier::set_plan_slot(int grp) {
@@ -3166,7 +3172,7 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
         copy_->wait();
         if (prof_on_) collect_profile();
         ++windows;
-        if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+        if (le_ < g.n_layers) { forward_handoff(); return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err); }
         if (!sample_rows(S, err)) return false;
         for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
         progress_at("decode");
@@ -3249,7 +3255,7 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
     copy_->wait();
     if (prof_on_) collect_profile();
     ++windows;
-    if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+    if (le_ < g.n_layers) { forward_handoff(); return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err); }
     if (!sample_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     progress_at("decode");

@@ -375,3 +375,43 @@ Reading the result:
 4. **T5 shows the fix direction**: same test, but the A770 first `memcpy`s the foreign host buffer into its OWN device buffer, then reads in place - **0 of 4096 wrong**. Cross-context COPIES work (matching the memcpy observation); in-place foreign-context host reads silently corrupt.
 
 Real-fix candidates (your plate): make the cross-card shared buffers per-consumer - a staging copy on the reading card (T5 pattern: verify hand-off rows, expert mirror reads, prefill hand-off at kernel level), or allocate each shared host buffer through the READING card's queue (per-stage `malloc_host` mirrors). Cross-platform shared contexts are not achievable. Run 7 only after a real fix lands.
+
+## 17. Review of the section 16 probes (2026-10-16): no shared context; one buffer per card instead
+
+The probes are decisive and correct the earlier fix.
+- Under UR on Windows every GPU is its own platform, and a context cannot span platforms (T1). `97dbfd8` was a no-op here and is **reverted** in this commit: `sycl/include/dpct/device.hpp` is back to the vendored file, and `STRATA_SYCL_SHARED_CONTEXT` is gone.
+- T3 / T5 settle the mechanism:
+  - a kernel reading another context's host USM in place gets wrong data with no error;
+  - a `memcpy` from it is right;
+  - (by the same logic) a card's kernels on its own context's host USM are right, and so is the CPU on any host memory.
+
+**Every place a card's kernel touched another context's host USM in a B580 + A770 split, and what it does now:**
+
+| Path | Before | Now (only when the two cards' contexts differ) |
+|---|---|---|
+| Verify hand-off rows (`copy_from_mapped` kernels: stage k writes, stage k+1 reads, one shared `malloc_host` buffer) | one side always foreign | one buffer per side, each allocated through its own card; the host `memcpy`s stage k's rows into stage k+1's buffer after stage k's window synced (`Verifier::forward_handoff`, before `next_->run` / `run_slot_rows`) |
+| The pool's PCIe share on a later stage (copy kernels read mirror / arena blobs allocated through CUDA0) | A770 kernels read CUDA0-context host memory | that stage's `pcie_num` is 0: the CPU computes its misses (`STRATA_SPLIT_PCIE_FOREIGN=1` keeps the reads, for testing) |
+| Prefill stage helper (the next card computes a share through mapped host rows) | both cards read in place | not bound across contexts: each stage reads its prompts alone |
+| `--pipeline-windows`, `--batch-groups` > 1 (the caller drives the hand-offs) | same shared buffers | refused with a message for now |
+
+Not affected, checked:
+- The prefill hand-off is a `memcpy`.
+- The CUDA0 device-plan mirror table is CUDA0's only (`in_mirror_table`).
+- Cache fills and adaptive swaps are copies.
+- Each verifier's flags, plans and pool rows are allocated under its own device.
+
+**"Contexts differ"** is `strata::cross_context(dev, owner)` (sycl_queue.hpp). It is true only on Windows, for two devices whose dpct contexts differ; `STRATA_SPLIT_CROSS_CONTEXT=1` / `=0` overrides. So:
+- Linux keeps its in-place hand-offs and PCIe reads.
+- One card, or `--split-device 0`, is unchanged.
+
+Not built here (no oneAPI in this container).
+
+**Cost:** the A770 stage's missed experts go to the CPU instead of PCIe, so expect lower decode than a split with PCIe reads. If the split now runs, the follow-up is to allocate each stage's share of the mirror / arena through that stage's own card and turn its PCIe share back on.
+
+**Run 7 (user-launched):** rebuild, then `start-2c-nomtp-p4096.bat` unchanged.
+- Expect the new lines at start:
+  - "CUDA0 and CUDA1 are in different SYCL contexts; the hand-off rows are copied ...";
+  - "CUDA1 ... reads no experts over PCIe";
+  - "stage 0 reads its prompts alone ...".
+- **If it decodes several windows:** drop `--prefill 4096` / `STRATA_PREFILL_HELP_FRAC=0` (the helper is off across contexts anyway), then `--mtp`, then speeds.
+- **If it still fails:** `STRATA_SPLIT_CROSS_CONTEXT=0` must reproduce the old failure exactly (proof the fix took effect). Then look for another in-place cross-context access; the T3 probe is the quick check for any suspect buffer.

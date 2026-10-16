@@ -124,6 +124,9 @@ public:
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    /// Windows layer split across contexts (strata::cross_context): this stage's hand-off is written into its own
+    /// buffer, and the host copies `bytes` of it into `dst` (the next stage's own buffer) before the next stage runs.
+    void set_handoff_copy(float* dst, size_t bytes) { hand_copy_ = dst; hand_copy_bytes_ = bytes; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
@@ -347,6 +350,9 @@ private:
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
+    float* hand_copy_ = nullptr;         ///< set_handoff_copy: the next stage's copy of hand_out_ (null: shared)
+    size_t hand_copy_bytes_ = 0;
+    void forward_handoff() const;        ///< hand_out_ -> hand_copy_ on the host, after this stage's window synced
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
