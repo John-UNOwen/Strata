@@ -53,7 +53,9 @@ inline void big_fill_zero(sycl::queue& q, void* p, size_t bytes, size_t chunk = 
 #endif
 #endif
 #include <cstdlib>
+#include <cstdio>
 #include <mutex>
+#include <string>
 #include <unordered_set>
 namespace strata {
 namespace detail {
@@ -76,6 +78,35 @@ inline void* host_malloc_polled(size_t bytes, sycl::queue& q) {
 #endif
     return sycl::malloc_host(bytes, q);
 }
+// STRATA_MTP_CHECK_CTX=1: name every pointer whose USM owner differs from the queue it is used on (the two-card
+// mtp faults: a kernel or a queue memcpy touching another context's host USM).  Diagnostics only, never fatal.
+inline bool mtp_ctx_check_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MTP_CHECK_CTX");
+        return v != nullptr && *v != '0';
+    }();
+    return on;
+}
+inline void mtp_ctx_check(const char* what, const void* p, sycl::queue& q) {
+    if (!mtp_ctx_check_on() || p == nullptr) return;
+    static std::mutex mu;
+    static std::unordered_set<std::string> seen;
+    std::lock_guard<std::mutex> lk(mu);
+    if (!seen.insert(what).second) return;   // one report per site: the sites are fixed strings
+    try {
+        const auto t = sycl::get_pointer_type(p, q.get_context());
+        if (t == sycl::usm::alloc::unknown) {
+            std::fprintf(stderr, "CTXCHECK %s: pointer is not USM in this context (native or plain host)\n", what);
+            return;
+        }
+        const sycl::device owner = sycl::get_pointer_device(p, q.get_context());
+        std::fprintf(stderr, "CTXCHECK %s: %s context; owner=%s queue=%s\n", what,
+                     owner == q.get_device() ? "own" : "FOREIGN",
+                     owner.get_info<sycl::info::device::name>().c_str(),
+                     q.get_device().get_info<sycl::info::device::name>().c_str());
+    } catch (const sycl::exception&) {}
+}
+
 inline void host_free_polled(void* p, sycl::queue& q) {
     if (p == nullptr) return;
 #ifdef STRATA_HAVE_ZE
