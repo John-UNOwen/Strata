@@ -2098,6 +2098,39 @@ struct PeTimer {
 };
 }  // namespace
 
+// STRATA_DBG_NAN: scan the persistent state of this stage's session (the GDN recurrent states and the QSA
+// indexer float buffers) that survives across requests.  The first scan that flips names the step that
+// poisons it (reviewer's instrument, handoff-mtp-k22-2026-10-16 section 2).  K/V pools are int8 here:
+// their corruption surfaces as these float states or the downstream GU/bo probes.
+static void dbg_stage_state_scan(const char* where, int64_t pos0, int64_t lb,
+                                 core::SessionState& ss, const core::ModelGeometry& g,
+                                 const strata::kernels::QsaShapes& s) {
+    if (std::getenv("STRATA_DBG_NAN") == nullptr) return;
+    std::vector<float> h;
+    int64_t c_gdn = 0, c_idx = 0;
+    auto scan = [&](const float* d, int64_t n, int64_t& out) {
+        if (d == nullptr || n <= 0) return;
+        h.resize((size_t) n);
+        dpct::get_in_order_queue().memcpy(h.data(), d, (size_t) n * 4).wait();
+        for (float v : h) {
+            uint32_t b;
+            std::memcpy(&b, &v, 4);
+            if ((b & 0x7f800000u) == 0x7f800000u) ++out;
+        }
+    };
+    const int64_t gdn_floats = (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                               (int64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    scan(ss.gdn_state, (int64_t) ss.gdn_alloc * gdn_floats, c_gdn);
+    for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
+        const core::QsaState& st = ss.qsa_states[ss.qsa_ord0 + j];
+        scan(st.idx_tail, (int64_t) (s.idx_block - 1) * s.idx_dim, c_idx);
+        scan(st.idx_dead, (int64_t) s.idx_dim, c_idx);
+        scan(st.idx_pooled, st.idx_pooled_rows * (int64_t) s.idx_dim, c_idx);
+    }
+    std::fprintf(stderr, "strata dbg: STATE %s [layers %lld-] pos %lld: GDN %lld, QSA indexer %lld non-finite\n",
+                 where, (long long) lb, (long long) pos0, (long long) c_gdn, (long long) c_idx);
+}
+
 bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                        std::string &err) try {
     err.clear();
@@ -2112,6 +2145,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     double grp_wait_ms = 0, grp_cpu_ms = 0;   // the per-layer grouping: the drain wait, the host's loops
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
+    if (pos0 == 0) dbg_stage_state_scan("request start", pos0, stage_lb_, ss, g, s);
     // read once (STRATA_KV_PREFETCH=1/0: the next streamed layer's KV prefix is staged on its own stream)
     static const bool kv_prefetch_on = [] {
         const char* e = std::getenv("STRATA_KV_PREFETCH");
@@ -4520,6 +4554,9 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
             const auto toc2 = Clock::now();
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
+        // the reviewer's state scan: right after the last stage reported the chunk (the on_chunk callback is
+        // where the split's mtp.prefill / draft fill for this chunk ran)
+        dbg_stage_state_scan("post on_chunk", p0, stage_lb_, ss, g, s);
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
         }
