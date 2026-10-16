@@ -110,3 +110,60 @@ Next probes (order): (1) scan the WINDOW INPUT rows at capture (window rows / wi
 ### Benchmark pollution ledger (the `!!!!!` bug taints speed numbers)
 INVALID (storm-contaminated, decode was garbage-token spam): k22 mtp 29.7 tok/s (09:10 graph run, window NaN at 7578 mid-request), 19.3/22.4 tok/s (09:03 eager run), and every k22 mtp run after a window NaN (1047/1325/7578/7630/7676 family).
 CLEAN baselines for the mtp-value question: nomtp B580-alone ~10.4 tok/s decode (KB control); mtp sd0 9.4-10.7 (17:05, drafts 66-78%); a770-alone nomtp 14.0/20.7 (KB control C); nomtp k22 64k daily (`strata-iq2_xs-2card-k22-ctx64k.log`): decode 18.0-24.4 tok/s with spec-4 suffix drafts already accepting 86% (276/321, 104/122). mtp has never beaten a clean nomtp baseline on any config that works; the only apparent gain (29.7 on k22) came from the broken one. To justify finishing cross-card mtp, a FIXED k22 mtp must beat 18-24 tok/s clean, ideally while raising the 86% suffix-draft acceptance the nomtp spec-4 path already gets.
+
+## Review 2 (2026-10-16, after runs A/B and the state / commit-row scans; code reading only)
+
+**Corrections to review 1.** Runs A and B rule out "E-4 on one context". The failure needs two contexts plus mtp. The first bad event is a decode window (positions 7578-7757), not the drafter's prompt pass. Section 1 of review 1 is answered.
+
+### The instruments (`6671e7f`, `7238ab8`) are correct
+- Both scans copy through the current card's default queue, but only after that card's work has finished:
+  - in the prompt pass, after `m.cs->wait()`;
+  - in `commit()`, after `run()` has synced (commit is synchronous on a split).
+- **Gap: the hand-off rows between the stages are not scanned.** A window whose scanned inputs are clean can still produce NaN at the A770 stage if its *input* rows came in bad. Add under `STRATA_DBG_NAN`:
+  - stage 0's `hand_out_` at the end of its window (B580);
+  - stage 1's `hand_in_` at the start of its window, after `forward_handoff`'s host copy (A770).
+
+  A non-finite `hand_in_` means the garbage is made on the B580 stage, and the A770 is only where it first shows.
+
+### New prime suspect: the B580's device-wait bound under `--mtp`
+`generate.cpp:2364`:
+```
+strata::spin_drafts_need_long_bound(o.spec >= 2 && o.mtp.empty());   // spin_max: drafting without MTP waits long
+```
+With it, `spin_max` (`sycl_doorbell.hpp:146-148`) gives a Battlemage card without a sysfs driver (Windows):
+- **without `--mtp`** (the clean nomtp spec-4 configs): 2,000,000 reads;
+- **with `--mtp`**: 20,000 reads.
+
+The 20,000 bound was measured (#1473) for B-series windows that only wait in a failure: all experts resident, or the device plan. At k22 the B580 stage is not all-resident; its cache holds about half of its layers' experts. So its windows really wait for the CPU pool's experts. A wait that expires lets the window run on without those experts' outputs. `docs/INTEL.md` (~line 708) describes that as the cause of `!!!!` (token 0) and crashes. Garbage leaving the B580 stage first shows up as NaN at the A770 stage, where the probes are.
+
+| Config | B580 bound | B580 stage all-resident? | Result | Fits? |
+|---|---|---|---|---|
+| k22 nomtp (spec-4) | 2,000,000 | no | clean | yes |
+| k22 + mtp | 20,000 | no | NaN | yes |
+| A770 alone + mtp | (Alchemist: 2,000,000) | - | clean | yes |
+| split11 + mtp (run D, not run) | 20,000 | **yes** (5,632 of 5,632) | predicted clean | - |
+| `--split-device 0` + mtp | 20,000 | no (hit 40.7%) | clean | **not explained** |
+
+For the last row: a guess, not verified, is that on one card the drafter and the windows serialize, so the host serves the B580's waits in time.
+
+**Test (cheap, config only):** the failing config (`start-2c-mtp-k22-check-graph.bat`) plus `STRATA_SPIN_MAX=2000000`, N >= 3.
+- **Clean:** the fix is to keep the long bound on any Battlemage stage that is not all-resident when `--mtp` is on. The 20,000 bound stays where it was measured: all-resident or device-plan windows.
+- **Same NaN:** the bound is not it. Go on with the hand-off scans above.
+
+### Why later requests start poisoned
+- The GDN and indexer float scans are clean at request start, yet request 2 is poisoned within chunk 0.
+- An unscanned carrier: the fp16 K/V scales (`k_scale` / `v_scale`, and `v_q4` scales under k8v4) of the QSA pools. A storm can write non-finite scales into cells, and a new request reuses those page slots.
+- That reaches a fresh request only if an attention kernel reads past `n_kv` (whole pages or tiles) and masks by multiplication instead of selection (NaN x 0 = NaN).
+- **Instrument:** scan the scales as half floats at request start.
+- This is the spread to later requests, not the root event. Restart between gate runs, as already done.
+
+### Checked by reading, nothing wrong found
+- **`verify.cpp:2656` ("no wait here", drafter on its own stream)** only applies with `g_commit_async`, which is off on a split (`generate.cpp:3309`). The commit waits.
+- **The drafter's read of the window's rows** (`MtpDrafter::stage_source_R`, `mtp.cpp:1821`) runs after `run()` has synced. Its foreign-owner staging only runs for a source on another card; in decode `src_R_` is the same card's `window_R_`.
+- **The drafter shares no scratch with the verifier's head.** It uses its own `xq_` / `head_logits_` and reads only `head_->weights()` (`mtp.cpp:1159`). `NativeHead::scratch_` is used by `NativeHead::run` alone.
+- **`pl_launch` / `batch_launch`** (no `forward_handoff`) are only reached under `--pipeline-windows` / `--batch-groups`, which are refused across contexts. mtp decode goes through `ver.run`, which does the hand-off copy.
+
+### Order
+1. k22 + mtp + `STRATA_SPIN_MAX=2000000` (N >= 3).
+2. Run D: split11 + mtp. That is the measured default, and its B580 stage is all-resident. It also answers the mtp-value question against split11's 35.5 tok/s clean decode.
+3. Only if 1 still fails: the hand-off row scans, then the K/V scale scan.
