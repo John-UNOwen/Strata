@@ -2,8 +2,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include <sycl/sycl.hpp>
 
 namespace strata::core {
 
@@ -55,6 +59,11 @@ public:
     void gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const;
     /// One row for a host token id.
     void gather_one(int64_t token, float* out, void* stream) const;
+    /// The table as allocated (its USM kind may belong to another queue's context).
+    const void* table() const { return dev_; }
+    /// The table a queue's context can read: itself when the queue shares the allocation context,
+    /// else a per-context host mirror (cross-context USM reads fail on the Windows oneAPI stack).
+    const void* table_for(sycl::queue& q) const;
     uint64_t bytes() const { return bytes_; }
     int type() const { return type_; }
 
@@ -65,6 +74,8 @@ private:
     size_t row_ = 0;
     int64_t n_embd_ = 0, n_vocab_ = 0;
     int type_ = -1;
+    std::optional<sycl::context> alloc_ctx_;                 // context the table was allocated in
+    mutable std::vector<std::pair<sycl::context, void*>> mirrors_;  // host mirrors, one per foreign context
 };
 void set_native_embed(const NativeEmbed* e);
 const NativeEmbed* native_embed();

@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <mutex>
 
 namespace strata::core {
 
@@ -270,6 +271,9 @@ bool NativeEmbed::load(const std::vector<std::string> &shards, int64_t n_embd,
         type_ = (int) t->type;
         n_embd_ = n_embd;
         n_vocab_ = n_vocab;
+        // The table's allocation context: gathers from another context (a layer split's other GPU) go through
+        // table_for's mirror (cross-context in-place host USM reads give wrong data, see strata/sycl_queue.hpp).
+        alloc_ctx_.emplace(dpct::get_in_order_queue().get_context());
         return true;
     } catch (const std::exception& e) {
         err = std::string("native embedding: ") + e.what();
@@ -283,11 +287,33 @@ catch (sycl::exception const &exc) {
 }
 
 void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const {
-    strata::kernels::iq_embed_rows(type_, dev_, row_, tokens, n_tok, n_embd_, out, stream);
+    sycl::queue* q = strata::q_of(stream);
+    strata::kernels::iq_embed_rows(type_, table_for(*q), row_, tokens, n_tok, n_embd_, out, stream);
 }
 
 void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
-    strata::kernels::iq_dequant_f32(type_, (const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
+    sycl::queue* q = strata::q_of(stream);
+    strata::kernels::iq_dequant_f32(type_, (const uint8_t*) table_for(*q) + (size_t) token * row_, n_embd_, out,
+                                    stream);
+}
+
+const void* NativeEmbed::table_for(sycl::queue& q) const {
+    const sycl::context ctx = q.get_context();
+    if (!alloc_ctx_.has_value() || ctx == *alloc_ctx_) return dev_;
+    for (auto& m : mirrors_)
+        if (m.first == ctx) return m.second;
+    static std::mutex mirror_mu;
+    std::lock_guard<std::mutex> guard(mirror_mu);
+    for (auto& m : mirrors_)
+        if (m.first == ctx) return m.second;
+    if (host_ == nullptr) return dev_;   // device-resident table: no mirror without its owning queue
+    void* m = sycl::malloc_host(bytes_, q);
+    if (m == nullptr) return dev_;
+    std::memcpy(m, host_, bytes_);       // pinned host to pinned host: legal across contexts on the CPU
+    mirrors_.emplace_back(ctx, m);
+    std::fprintf(stderr, "strata: native embedding: host mirror for a foreign queue context (%llu MiB)\n",
+                 (unsigned long long) (bytes_ >> 20));
+    return m;
 }
 
 }  // namespace strata::core
