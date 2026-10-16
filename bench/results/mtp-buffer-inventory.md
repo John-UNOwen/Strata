@@ -1,5 +1,14 @@
 # MTP buffer inventory (Phase 0, 2026-10-16)
 
+## Correction (after the Phase 2 review, same day) - READ FIRST
+An adversarial review of the first phase 2 attempt (`a889a46`, reverted by `d889a46`) proved the row buffers below are **DEVICE arenas, not host-mapped**: `verify.cpp:610` `arena_ = malloc_device_guarded`, `R_` carved from it (`verify.cpp:573`), `final_R(t)/final_R_all()` return arena device pointers (`verify.cpp:784`, `verify.hpp:244-246`), `mtp.hpp:88-105` documents `R_rows`/`R_row` as `(device)`, and `pl_mtp_R` / bind rows are `sycl::malloc_device` (`generate.cpp:7374/7413`). Host CPU reads/writes of device USM are an access violation on this PC (reviewer probe: 0xC0000005). Treat every "mapped/host" verdict for row buffers below as superseded.
+The probe matrix was extended to cover the real pattern (`C:\strata-deps\cross_usm_probe.exe`, modes `dev*`):
+- T9a: consumer-side queue memcpy, own dst <- FOREIGN DEVICE src: **aborts (0xC0000409)**.
+- T9b: producer-side queue memcpy, foreign dst <- own src: **also aborts**.
+- T10: two-step staging, owner queue copies device src into plain pageable host (vector) with wait, then consumer queue copies host -> its own device: **0 of 4096 values wrong**.
+Consequence: the committed fix (`37cd444`) stages foreign-device row sources exactly like T10 (`strata::mtp_foreign_owner` detection in sycl_queue.hpp; staging in prefill both paths, stage_source_R, draft_first; per-group staging drains so the staging buffer is never rewritten mid-copy). Same-context groups and single-card platforms keep the original single-hop queue copies unchanged.
+Prime suspect for the warmup death (why the original code dies without mtp staying fine): `generate.cpp:12585` `draft_first(..., ss.R, ...)` where `SessionLoopScratch::ss` (init `generate.cpp:5907-5915`, default device = B580) is a **B580 device arena** while the drafter window lives on A770 - a T9a-shaped copy. `STRATA_MTP_CHECK_CTX=1` (rewritten helper: honest type reporting, scans every GPU context to name foreign owners, dedupe per site+pointer, `1`-only env convention) now prints one CTXCHECK line per distinct pointer, including who owns it.
+
 Method: read-only audit of the MTP code paths on `mtp-cross-card` (HEAD `20c693c`, drafter WIP included). No GPU run. Context column = which SYCL context the allocation belongs to: on Windows each GPU is its own platform, so "default" means CUDA0 (B580) unless an `OnDevice` guard is active at the call.
 
 Legend: OK = reader and allocator contexts match. FLAG = candidate cross-context in-place access, must be resolved in Phase 2. CHECK = needs one grep or a 1-line experiment to settle.
