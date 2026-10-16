@@ -1,101 +1,82 @@
-// sycl/tools/graph_probe.cpp - does a SYCL graph run on this card?  (Windows two-card debugging, HANDOFF section 12.)
-//
-// The engine records its decode windows, commits and MTP steps as SYCL graphs.  On the Windows B580 + A770 PC every
-// two-card failure followed graph work on the A770.  This probe runs the same pattern in miniature, on one context that
-// holds every visible card (as dpct's default context does): three kernels eagerly, then the same three recorded as a
-// graph and replayed, waiting after each replay, then replayed back to back.  Every step prints before it starts, so a
-// hang names its step.
-//
-//   graph_probe [device index among the visible GPUs, default: the last] [replays, default 20]
-//
-// Build with the same icx line as the other probes (-fsycl).  Run it with the engine's environment
-// (UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1), and A/B one variable per run: the selector (level_zero:1 alone, or
-// level_zero:0;level_zero:1 with index 1) and SYCL_UR_USE_LEVEL_ZERO_V2=0.  Each kernel runs for microseconds: if a
-// step does not finish, the graph path itself is stuck, and the TDR watchdog resets the card after ~10 s.
+// graph_probe.cpp - Level Zero command_graph capture/replay at a selector position.
+// graph_probe <pos> [replays]: the same graph path the engine's window uses
+// (command_graph<modifiable>, begin/end_recording on a dedicated queue, finalize,
+// ext_oneapi_graph), ~2400 nodes per replay so a capture or replay failure shows
+// up at the engine's scale. Every step prints before it starts, flushed.
 #include <sycl/sycl.hpp>
-
-#include <chrono>
+#include "dpct/dpct.hpp"
+#include "dpct/graph.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
+using namespace sycl;
 
-namespace sx = sycl::ext::oneapi::experimental;
+static void step(const std::string& msg) { std::printf("%s\n", msg.c_str()); std::fflush(stdout); }
 
-static void say(const char* fmt, double v = 0.0) {
-    std::printf(fmt, v);
-    std::printf("\n");
-    std::fflush(stdout);
-}
+int main(int argc, char** argv) {
+    const int pos = argc > 1 ? std::atoi(argv[1]) : 0;
+    const int replays = argc > 2 ? std::atoi(argv[2]) : 100;
+    const int nodes = 2400; // the engine's window graph size
 
-int main(int argc, char** argv) try {
-    const std::vector<sycl::device> devs = sycl::device::get_devices(sycl::info::device_type::gpu);
-    if (devs.empty()) { say("no GPU visible"); return 1; }
-    for (size_t i = 0; i < devs.size(); ++i)
-        std::printf("GPU %zu: %s (driver %s)\n", i, devs[i].get_info<sycl::info::device::name>().c_str(),
-                    devs[i].get_info<sycl::info::device::driver_version>().c_str());
-    const int idx = argc > 1 ? std::atoi(argv[1]) : (int) devs.size() - 1;
-    const int reps = argc > 2 ? std::atoi(argv[2]) : 20;
-    if (idx < 0 || idx >= (int) devs.size() || reps < 1) { say("bad arguments"); return 2; }
-    const sycl::device d = devs[(size_t) idx];
-    std::printf("testing GPU %d, %d replays, SYCL_UR_USE_LEVEL_ZERO_V2=%s\n", idx, reps,
-                std::getenv("SYCL_UR_USE_LEVEL_ZERO_V2") ? std::getenv("SYCL_UR_USE_LEVEL_ZERO_V2") : "(unset)");
-    std::fflush(stdout);
-
-    const sycl::context ctx{devs};   // one context for every visible card, as the engine has
-    sycl::queue q{ctx, d, {sycl::property::queue::in_order{}}};
-    constexpr size_t N = 1 << 20;
-    int* buf = sycl::malloc_device<int>(N, q);
-    q.memset(buf, 0, N * sizeof(int)).wait();
-    auto three = [&](sycl::queue& qq) {
-        for (int k = 0; k < 3; ++k) qq.parallel_for(sycl::range<1>(N), [=](sycl::id<1> i) { buf[i] += 1; });
-    };
-    using Clock = std::chrono::steady_clock;
-    auto ms = [](Clock::time_point a) { return std::chrono::duration<double, std::milli>(Clock::now() - a).count(); };
-
-    say("1. eager: 3 kernels ...");
-    Clock::time_point t = Clock::now();
-    three(q);
-    q.wait();
-    say("   done in %.2f ms", ms(t));
-
-    say("2. graph: record + finalize ...");
-    sx::command_graph g{ctx, d};
-    g.begin_recording(q);
-    three(q);
-    g.end_recording();
-    auto exec = g.finalize();
-    say("   done");
-
-    say("3. graph: replay, wait after each ...");
-    for (int r = 0; r < reps; ++r) {
-        t = Clock::now();
-        q.ext_oneapi_graph(exec);
-        q.wait();
-        std::printf("   replay %d: %.2f ms\n", r, ms(t));
-        std::fflush(stdout);
+    step("graph_probe: selector position " + std::to_string(pos) +
+         ", " + std::to_string(replays) + " replays");
+    auto all = device::get_devices(); // filtered by ONEAPI_DEVICE_SELECTOR
+    std::vector<device> gpus;
+    for (auto& d : all)
+        if (d.is_gpu()) gpus.push_back(d);
+    if (pos < 0 || pos >= (int)gpus.size()) {
+        std::printf("only %d GPUs visible\n", (int)gpus.size());
+        return 2;
     }
+    device dev = gpus[pos];
+    step("device: " + dev.get_info<info::device::name>() +
+         " | driver " + dev.get_info<info::device::driver_version>());
 
-    say("4. graph: replays back to back, one wait ...");
-    t = Clock::now();
-    for (int r = 0; r < reps; ++r) q.ext_oneapi_graph(exec);
-    q.wait();
-    say("   done in %.2f ms", ms(t));
+    step("step: create dedicated queue");
+    // the engine's cs_ is dpct create_queue(true): an in-order queue
+    queue q(dev, property::queue::in_order{});
 
-    say("5. eager after graph: 3 kernels ...");
-    t = Clock::now();
-    three(q);
-    q.wait();
-    say("   done in %.2f ms", ms(t));
+    int* out = (int*)malloc_host(1, q); // mapped sentinel, like the engine's flags
+    float* buf = malloc_device<float>(nodes + 1, q);
 
-    int first = 0, last = 0;
-    q.memcpy(&first, buf, sizeof(int)).wait();
-    q.memcpy(&last, buf + N - 1, sizeof(int)).wait();
-    const int want = 3 + 3 * reps + 3 * reps + 3;
-    std::printf("check: buf[0] = %d, buf[N-1] = %d, want %d: %s\n", first, last, want,
-                first == want && last == want ? "PASS" : "FAIL");
-    sycl::free(buf, q);
-    return first == want && last == want ? 0 : 3;
-} catch (const sycl::exception& e) {
-    std::printf("sycl exception: %s\n", e.what());
-    return 4;
+    step("step: warm kernel + buffers");
+    q.parallel_for(nodes, [=](id<1> i) { buf[i] = 0.0f; }).wait();
+    *out = 0;
+
+    step("step: begin_recording " + std::to_string(nodes) + " nodes");
+    // exactly the engine path: dpct::experimental::begin_recording on a dedicated
+    // queue (command_graph<modifiable>(context, device)), submits, end_recording,
+    // then command_graph<executable>(graph->finalize()) and ext_oneapi_graph
+    dpct::experimental::begin_recording(&q);
+    for (int n = 0; n < nodes; ++n)
+        q.submit([=](handler& h) {
+            h.single_task([=]() {
+                buf[n] = buf[n] + 1.0f;
+                if (n == nodes - 1) *out = *out + 1; // one bump per replay
+            });
+        });
+    step("step: end_recording");
+    dpct::experimental::command_graph_ptr graph = nullptr;
+    dpct::experimental::end_recording(&q, &graph);
+    if (graph == nullptr) { std::printf("end_recording produced no graph\n"); return 4; }
+
+    step("step: finalize");
+    dpct::experimental::command_graph_exec_ptr exec =
+        new ext::oneapi::experimental::command_graph<
+            ext::oneapi::experimental::graph_state::executable>(graph->finalize());
+    delete graph;
+
+    step("step: replay loop");
+    for (int r = 0; r < replays; ++r) {
+        step("replay " + std::to_string(r + 1) + "/" + std::to_string(replays));
+        q.ext_oneapi_graph(*exec);
+        q.wait();
+        if (*out != r + 1) {
+            std::printf("sentinel after replay %d: %d (expected %d)\n", r + 1, *out, r + 1);
+            return 3;
+        }
+    }
+    step("done: all replays finished with the sentinel correct");
+    return 0;
 }
