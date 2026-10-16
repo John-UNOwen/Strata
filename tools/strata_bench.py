@@ -44,6 +44,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -175,6 +176,40 @@ def chat(base: str, key: str, messages: list, max_tokens: int, think: bool = Fal
             "pieces": pieces}
 
 
+# ------------------------------------------------------------------------------------------ reply quality (pollution gate)
+# A poisoned session (a non-finite window reached the sampler) keeps serving garbage until a restart: the classic
+# signatures are a burst of one repeated character (the '!' x 257 storms) or a tight loop of the few characters or
+# words. Scoring the reply text client-side needs no engine debug flags, whose synchronous scans can themselves
+# mask the fault. A flagged request voids the whole session's numbers (the pollution is sticky).
+JUNK_RUN = 30            # longest burst of one repeated non-space character that is already a storm, not emphasis
+JUNK_CHAR_LOOP = 0.30    # top 4-character substring's share of the reply
+JUNK_WORD_LOOP = 0.25    # top 3-word sequence's share of the reply (normal 100-token replies sit near 0.02-0.12)
+
+
+def junk_score(text: str) -> dict:
+    t = text or ""
+    run, best_char, cur, prev = 0, "", 0, ""
+    for ch in t:
+        if ch.isspace():
+            cur = 0
+        elif ch == prev:
+            cur += 1
+            if cur > run:
+                run, best_char = cur, ch
+        else:
+            cur = 1
+        prev = ch
+    s = re.sub(r"\s+", " ", t).lower()
+    grams = [s[i:i + 4] for i in range(len(s) - 3)]
+    char_loop = max(Counter(grams).values()) / len(grams) if grams else 0.0
+    words = s.split()
+    wgrams = [(words[i], words[i + 1], words[i + 2]) for i in range(len(words) - 2)]
+    word_loop = max(Counter(wgrams).values()) / len(wgrams) if len(wgrams) >= 8 else 0.0
+    polluted = run >= JUNK_RUN or (len(grams) >= 20 and char_loop >= JUNK_CHAR_LOOP) or word_loop >= JUNK_WORD_LOOP
+    return {"max_run": run, "run_char": best_char, "char_loop": round(char_loop, 2), "word_loop": round(word_loop, 2),
+            "polluted": polluted, "excerpt": re.sub(r"\s+", " ", t.strip())[:140] if polluted else None}
+
+
 def digest(r: dict) -> dict:
     """The numbers of one request, the engine's own where it reported them."""
     u, t = r.get("usage") or {}, r.get("timings") or {}
@@ -199,6 +234,15 @@ def digest(r: dict) -> dict:
             "decode_tps": dec, "decode_tps_source": dsrc if dec is not None else None,
             "prompt_ms": t.get("prompt_ms"), "decode_ms": t.get("predicted_ms"),
             "drafts_offered": t.get("draft_n"), "drafts_accepted": t.get("draft_n_accepted")}
+
+
+def digest_junk(r: dict) -> dict:
+    """digest() plus the reply-quality verdict; the excerpt is only carried when a request is flagged."""
+    d = digest(r)
+    j = junk_score(r.get("text") or "")
+    d.update(reply_max_run=j["max_run"], reply_char_loop=j["char_loop"], reply_word_loop=j["word_loop"],
+             polluted=j["polluted"], pollution_excerpt=j["excerpt"])
+    return d
 
 
 # ----------------------------------------------------------------------------------------------------- statistics
@@ -228,7 +272,8 @@ class Suite:
         self.quick = quick
         self.nonce = str(int(time.time()))
         self.tokens_per_word, self.overhead = 1.1, 40
-        self.out: dict = {"chat": {}, "prompts": {}, "agent": {}, "clients": {}, "skipped": {}, "failures": []}
+        self.out: dict = {"chat": {}, "prompts": {}, "agent": {}, "clients": {}, "skipped": {}, "failures": [],
+                          "pollution": []}
 
     def tag(self, *parts) -> str:
         return "-".join([*map(str, parts), self.nonce])
@@ -237,12 +282,21 @@ class Suite:
         self.out["failures"].append({"where": where, "error": d.get("err") or "no token came back"})
         self.log(f"    FAILED: {d.get('err') or 'no token came back'}")
 
+    def check_pollution(self, where, d):
+        if d.get("polluted"):
+            self.out["pollution"].append({"where": where, "run": d.get("run"), "max_run": d.get("reply_max_run"),
+                                          "char_loop": d.get("reply_char_loop"), "word_loop": d.get("reply_word_loop"),
+                                          "excerpt": d.get("pollution_excerpt")})
+            self.log(f"    POLLUTED REPLY at {where}: storm/loop signature. A poisoned session stays poisoned: "
+                     f"treat this session's numbers as void and re-run after a server restart.")
+
     def calibrate(self):
         """Words that make a prompt of a wanted size: two tiny requests (200 and 800 words) give the tokens per word as a
         slope, so the template's fixed part does not skew it."""
         pts = []
         for words in (200, 800):
-            r = digest(chat(self.base, self.key, [{"role": "user", "content": f"[{self.tag('cal', words)}]\n" + long_prompt(words)}], 1))
+            r = digest_junk(chat(self.base, self.key, [{"role": "user", "content": f"[{self.tag('cal', words)}]\n" + long_prompt(words)}], 1))
+            self.check_pollution("calibration", r)
             pts.append(r.get("prompt_tokens"))
         slope = (pts[1] - pts[0]) / 600 if all(pts) and pts[1] > pts[0] else None
         self.tokens_per_word = slope or 1.1
@@ -254,20 +308,23 @@ class Suite:
         return [{"role": "user", "content": f"[bench {self.tag(run, tokens, 'p')}]\n" + long_prompt(words)}]
 
     def warm_up(self):
-        self.log("warming up (not measured) ...")
-        chat(self.base, self.key, [{"role": "user", "content": PROMPTS[0]}], 24, self.think)
+        self.log("warming up (not measured, but pollution-scored: a storm here voids the session) ...")
+        d = digest_junk(chat(self.base, self.key, [{"role": "user", "content": PROMPTS[0]}], 24, self.think))
+        self.check_pollution("warmup chat", d)
         self.calibrate()
-        chat(self.base, self.key, self.prompt_for(1024, -1), 8, self.think)
+        d = digest_junk(chat(self.base, self.key, self.prompt_for(1024, -1), 8, self.think))
+        self.check_pollution("warmup 1K prompt", d)
 
     def run_chat(self):
         self.log(f"chat: {len(PROMPTS)} short questions x {self.runs} runs, up to {CHAT_MAX_TOKENS} new tokens")
         rows = []
         for run in range(self.runs):
             for i, p in enumerate(PROMPTS):
-                d = digest(chat(self.base, self.key, [{"role": "user", "content": f"[{self.tag(run, i, 'c')}] {p}"}],
-                                CHAT_MAX_TOKENS, self.think))
+                d = digest_junk(chat(self.base, self.key, [{"role": "user", "content": f"[{self.tag(run, i, 'c')}] {p}"}],
+                                     CHAT_MAX_TOKENS, self.think))
                 d.update(run=run, prompt=i)
                 rows.append(d)
+                self.check_pollution(f"chat run {run + 1} q{i + 1}", d)
                 if not d["ok"]:
                     self.fail("chat", d)
                 else:
@@ -286,9 +343,10 @@ class Suite:
         self.log(f"{label} prompt: {self.runs} fresh prompts of about {tokens} tokens, {LONG_MAX_TOKENS} new tokens")
         rows = []
         for run in range(self.runs):
-            d = digest(chat(self.base, self.key, self.prompt_for(tokens, run), LONG_MAX_TOKENS, self.think))
+            d = digest_junk(chat(self.base, self.key, self.prompt_for(tokens, run), LONG_MAX_TOKENS, self.think))
             d["run"] = run
             rows.append(d)
+            self.check_pollution(f"{label} run {run + 1}", d)
             if not d["ok"]:
                 self.fail(label, d)
             else:
@@ -328,9 +386,10 @@ class Suite:
                 rel, body = files[t - 1]
                 msgs.append({"role": "user", "content": f"File {rel}:\n{body}\n\nWhat is this file for? Two sentences."})
             r = chat(self.base, self.key, msgs, AGENT_MAX_TOKENS, self.think, tools=TOOLS)
-            d = digest(r)
+            d = digest_junk(r)
             d.update(run=run, turn=t)
             turns.append(d)
+            self.check_pollution(f"agent run {run + 1} turn {t}", d)
             if not d["ok"]:
                 self.fail("agent", d)
                 break
@@ -809,10 +868,11 @@ def render_readme(res: dict) -> str:
     gpu = " + ".join(mc.get("gpu") or []) or "CPU only"
     vram = f"{mc['gpu_vram_mib'] / 1024:.0f} GiB VRAM" if mc.get("gpu_vram_mib") else "VRAM not read"
     model = (model_label(mc) if mc.get("model") else mc.get("quant")) or "model not read"
+    pol = out.get("pollution") or []
     L = [f"# Community benchmark on {gpu}", "",
          f"Measured on {res['date']} with `tools/strata_bench.py` (suite {SCHEMA}, {p['runs']} runs per test, medians with ranges). "
-         f"Speeds are the engine's own timings; first-token times are measured by the client over HTTP. Speed only: no "
-         f"correctness check was run.", "",
+         f"Speeds are the engine's own timings; first-token times are measured by the client over HTTP. Speed suite plus a "
+         f"reply quality gate (storm/loop signatures in any reply void the session's numbers).", "",
          "## Hardware and software", "",
          f"- GPU and VRAM: {gpu}, {vram}",
          f"- CPU: {mc.get('cpu') or 'not read'} ({mc.get('cpu_cores') or '?'} cores, {mc.get('cpu_threads') or '?'} threads); "
@@ -847,6 +907,15 @@ def render_readme(res: dict) -> str:
           "## Results", ""]
     L += results_table(out)
     L += ["", "Ranges are the lowest and highest of the runs; `Runs` counts requests that returned a token."]
+    if pol:
+        L += ["", "### POLLUTED - this session's numbers are void", "",
+              f"{len(pol)} repl{'y' if len(pol) == 1 else 's'} showed a storm or loop signature. A session that served one "
+              f"non-finite window keeps serving fast garbage until a restart, so every number above is untrustworthy. "
+              f"Restart the server and re-run.", ""]
+        for e in pol:
+            L.append(f"- {e['where']}: longest repeated character {e['max_run']}, loop shares {e['char_loop']}/{e['word_loop']}"
+                     + (f"; reply began: `{e['excerpt']}`" if e.get("excerpt") else ""))
+        L.append("")
     ag = out["agent"]
     if ag and ag.get("sessions"):
         L += ["", "### Agent session (conversation cache)", "",
@@ -868,7 +937,8 @@ def render_readme(res: dict) -> str:
         L += [f"- failed {f['where']}: {f['error']}" for f in out["failures"]]
     L += ["", "Per-request data: `results.json`. Engine log lines from the start: `engine-log-excerpt.txt` (when this run started the server).", "",
           "## Correctness and limitations", "",
-          "Not measured: this is a speed suite. The conversation uses the model's own replies, so token counts differ a little between runs. "
+          "The gate flags storm/loop signatures in replies (client-side text scoring; no engine debug flags, whose "
+          "synchronous scans can mask a fault). Answer correctness beyond that is not measured. The conversation uses the model's own replies, so token counts differ a little between runs. "
           "Machine details come from the server, `nvidia-smi`/`rocm-smi` and the OS; background load and power limits are not recorded. "
           f"Total time of the suite: {res['elapsed_s']:.0f} s.", ""]
     return "\n".join(L)
@@ -1008,6 +1078,9 @@ def main(argv=None) -> int:
         say(red(short_table(res)))
         if out["failures"] or out["skipped"]:
             say(f"  ({len(out['failures'])} failed request(s), {len(out['skipped'])} skipped test(s): see the report)")
+        if out.get("pollution"):
+            say(f"\n  POLLUTED: {len(out['pollution'])} polluted repl{'y' if len(out['pollution']) == 1 else 'ies'} in this session - "
+                f"the numbers are void. Restart the server and re-run (see the report's pollution section).")
         if a.compare:
             say("\nCompared with " + a.compare + ":")
             say(red(compare_table(load_results(Path(a.compare)), redact_obj(res, lambda s: s))))

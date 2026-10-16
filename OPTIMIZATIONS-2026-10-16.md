@@ -25,17 +25,30 @@ arms on them mixes speed with a moving fault. **k22 daily numbers** (`start-2car
 now): prompt 260-320 tok/s, decode 18-25, suffix drafts up to ~86% accepted. k22 also serves images (CPU encoder,
 280-297 tok/s map prompts): at k22 the bigger B580 share no longer buys prompt speed, so the frontier costs little today.
 
-Against VicGPT's bar and the old llama.cpp Vulkan model:
-- **Prompt:** k22 benched 367 (4K) / 616 (16K) tok/s (table below), still above llama.cpp's 380-420; its map-sized
-  8-18K warm reads run 260-320. The split11-class 851 is the number the frontier hunt could restore.
-- **Decode:** k22 18-25 tok/s is about 1.2-1.5x llama.cpp's ~16.
+Against VicGPT's bar and the old llama.cpp Vulkan model (the two-card numbers below are pollution-unverified, see the
+gate note; the k22 evening numbers are post-fix):
+- **Prompt:** k22 benched 367 (4K) / 616 (16K) tok/s (table below, suspect era); its post-fix map-sized 8-18K warm
+  reads run 260-320. The split11-class 851 is the number the frontier hunt could restore.
+- **Decode:** k22 18-25 tok/s (post-fix) is about 1.2-1.5x llama.cpp's ~16.
 - **A 10k-token map chunk** reads in about 30-38 s at k22 (was 12-16 s at split11).
 
 **Arms for the k22 baseline** (`python bench/arms/make_arms_k22.py`, then `bench/arms/run-arm.bat <arm>`):
 `k22ref`, `k22mirror6000`, `k22mirror10000`, `k22prefill16k`, `k22own4096`, `k22own4096mirror`, `k22ctx32k`, `k22ctx32kmirror`.
 The old split11-based arms (`make_arms.py`) stay for the frontier hunt itself.
 
-Historical baseline table (split11 era, `2ccc945`):
+**These morning numbers are pollution-unverified and now treated as suspect.** They were benched 06:2x-07:42 on the
+engine *before* the scratch-race fix (`9953a5b`, ~09:45), i.e. the version that provably NaN'd split11-class runs in
+the same hour (the 07:4x noborrow ladder). One poisoned window makes every later request in the session fast garbage
+while staying internally consistent, and `strata_bench.py` stored no reply text and ran no quality check, so a storm
+during the discarded warmup would have tainted every number invisibly. Tight ranges (620.9 603-622; 37.0 36.0-37.7)
+are not evidence of cleanliness - a poisoned session is consistently fast.
+
+`tools/strata_bench.py` now carries a client-side **pollution gate**: every reply (warmup included) is scored for
+storm signatures (long single-character bursts) and degenerate loops; any hit voids the session's numbers, prints a
+POLLUTED banner and lists the flagged replies in the report. It needs no engine debug flags - whose synchronous scans
+can mask the fault (2/2 runs). Re-baseline every claim on the fixed engine with this gate: `run-arm.bat k22ref` first.
+
+Historical baseline table (split11 era, `2ccc945`; pollution-unverified, kept only for shape):
 
 | Config | Prompt 4K | Prompt 16K | Decode |
 |---|---|---|---|
