@@ -145,6 +145,35 @@ inline void mtp_ctx_check(const char* what, const void* p, sycl::queue& q) {
     } catch (const sycl::exception&) {}
 }
 
+// Two-card Windows split (cross_usm_probe, 2026-10-16): a queue memcpy with a DEVICE operand owned by another
+// SYCL context is fatal in either direction (T9a consumer-side, T9b producer-side: both abort).  A copy through
+// plain host memory is clean (T10).  mtp_foreign_owner(p, self) returns the queue of the context that owns `p`
+// as DEVICE memory when that is not `self`'s context (the caller then stages: owner's queue copies p into plain
+// host memory, and self's queue copies from there); nullptr means `p` may be consumed directly by `self`'s queue
+// (own device memory, any host USM - T5/T8 clean - or plain pageable memory).
+inline sycl::queue* mtp_foreign_owner(const void* p, sycl::queue& self) {
+    if (p == nullptr) return nullptr;
+    try {
+        if (sycl::get_pointer_type(p, self.get_context()) != sycl::usm::alloc::unknown) return nullptr;
+    } catch (const sycl::exception&) {}
+    static std::mutex scan_mu;
+    static std::vector<sycl::queue> others;   // one queue per GPU, built once; stable afterwards
+    std::lock_guard<std::mutex> lk(scan_mu);
+    if (others.empty()) {
+        for (const sycl::device& d : sycl::device::get_devices()) {
+            if (d.get_info<sycl::info::device::device_type>() == sycl::info::device_type::cpu) continue;
+            if (d == self.get_device()) continue;
+            others.emplace_back(d);
+        }
+    }
+    for (sycl::queue& dq : others) {
+        sycl::usm::alloc ot = sycl::usm::alloc::unknown;
+        try { ot = sycl::get_pointer_type(p, dq.get_context()); } catch (const sycl::exception&) { continue; }
+        if (ot == sycl::usm::alloc::device) return &dq;   // foreign VRAM
+    }
+    return nullptr;   // plain host or foreign HOST USM: the consumer's own queue may copy it directly
+}
+
 inline void host_free_polled(void* p, sycl::queue& q) {
     if (p == nullptr) return;
 #ifdef STRATA_HAVE_ZE

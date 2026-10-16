@@ -1411,10 +1411,30 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         const int32_t* d_stp = d_tk + n;
         const int32_t* d_ps = d_stp + 4 * n;
         strata::mtp_ctx_check("prefill R_rows", R_rows, *cs_);
+        bool staged_prev = false;
         for (int64_t c = 0; c < n; c += max_t_) {
             const int T = (int) std::min<int64_t>(max_t_, n - c);
             if (cell0 + c + T <= first_needed) continue;
             if (!capture_prefill_dev(T, err)) return false;
+            if (staged_prev) {   // the previous group's host-staged rows must be fully read before reuse
+                if (DPCT_CHECK_ERROR(cs_->wait()) != 0) {
+                    err = "mtp prefill: the staged rows sync failed";
+                    return false;
+                }
+                staged_prev = false;
+            }
+            // Windows two-card split: rows produced by the other card's verifier arena would make cs_'s copy
+            // engine dereference foreign VRAM - fatal in both directions (cross_usm_probe T9a/T9b).  Stage them
+            // through plain host memory using the OWNING context's queue (probe T10); same-context groups and
+            // single-card platforms take the original single-hop path untouched.
+            const float* rows_src = R_rows + (size_t)c * HCN;
+            static thread_local std::vector<float> xstage;
+            if (sycl::queue* oq = strata::mtp_foreign_owner(rows_src, *cs_)) {
+                if (xstage.size() < (size_t)T * HCN) xstage.resize((size_t)T * HCN);
+                oq->memcpy(xstage.data(), rows_src, (size_t)T * HCN * sizeof(float)).wait();
+                rows_src = xstage.data();
+                staged_prev = true;
+            }
             /*
             DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
@@ -1446,7 +1466,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
                 event return by memcpy API to ensure synchronization behavior.
                 */
                 DPCT_CHECK_ERROR(
-                    cs_->memcpy(Rin_, R_rows + (size_t)c * HCN,
+                    cs_->memcpy(Rin_, rows_src,
                                 (size_t)T * HCN * sizeof(float))) != 0 ||
                 DPCT_CHECK_ERROR(
                     (cs_)->ext_oneapi_graph(*prefill_dev_exec_[T])) != 0) {
@@ -1494,6 +1514,15 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         const int T = (int) std::min<int64_t>(max_t_, n - c);
         if (cell0 + c + T <= first_needed) continue;
         if (!capture_prefill(T, err)) return false;
+        // Rows from the other card's arena: staged like the E-4 pass above (cross_usm_probe T9a/T10).
+        // This loop syncs cs_ at the end of every group, so the staging buffer is never rewritten mid-copy.
+        const float* rows_src = R_rows + (size_t)c * HCN;
+        static thread_local std::vector<float> xstage_legacy;
+        if (sycl::queue* oq = strata::mtp_foreign_owner(rows_src, *cs_)) {
+            if (xstage_legacy.size() < (size_t)T * HCN) xstage_legacy.resize((size_t)T * HCN);
+            oq->memcpy(xstage_legacy.data(), rows_src, (size_t)T * HCN * sizeof(float)).wait();
+            rows_src = xstage_legacy.data();
+        }
         for (int t = 0; t < T; ++t) {
             const int64_t cell = cell0 + c + t;
             h_tok_[t] = next_tokens[c + t];
@@ -1509,7 +1538,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        if (DPCT_CHECK_ERROR(cs_->memcpy(Rin_, R_rows + (size_t)c * HCN,
+        if (DPCT_CHECK_ERROR(cs_->memcpy(Rin_, rows_src,
                                          (size_t)T * HCN * sizeof(float))) !=
                 0 ||
             DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*prefill_exec_[T])) != 0 ||
@@ -1742,17 +1771,34 @@ bool MtpDrafter::stage_source_R(int T, std::string &err) try {
     if (src_R_ == nullptr || src_R_ == window_R_) return true;
     strata::mtp_ctx_check("stage_source_R src", src_R_, *cs_);
     strata::mtp_ctx_check("stage_source_R dst", window_R_, *cs_);
+    // Rows from the other card's verifier arena are staged through plain host memory (cross_usm_probe T9a/T10);
+    // same-context sources keep the original queue copy.
+    const int64_t HCN = g_->hc * g_->n_embd;
+    const size_t row_bytes = (size_t)T * (size_t)HCN * sizeof(float);
+    const float* rows_src = src_R_;
+    static thread_local std::vector<float> xrows;
+    bool staged = false;
+    if (sycl::queue* oq = strata::mtp_foreign_owner(src_R_, *cs_)) {
+        if (xrows.size() < (size_t)T * (size_t)HCN) xrows.resize((size_t)T * (size_t)HCN);
+        oq->memcpy(xrows.data(), src_R_, row_bytes).wait();
+        rows_src = xrows.data();
+        staged = true;
+    }
     /*
     DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
     the origin API might be synchronous, it depends on the type of operand
     memory, so you may need to call wait() on event return by memcpy API to
     ensure synchronization behavior.
     */
-    if (DPCT_CHECK_ERROR(cs_->memcpy((void *)window_R_, src_R_,
-                                     (size_t)T * (size_t)(g_->hc * g_->n_embd) *
-                                         sizeof(float))) != 0) {
+    if (DPCT_CHECK_ERROR(cs_->memcpy((void *)window_R_, rows_src, row_bytes)) != 0) {
         err = "mtp: staging the window's residual rows failed";
         return false;
+    }
+    if (staged) {   // cs_ may still be reading the host staging buffer: drain before this frame can be reused
+        if (DPCT_CHECK_ERROR(cs_->wait()) != 0) {
+            err = "mtp: the staged window rows sync failed";
+            return false;
+        }
     }
     return true;
 }
@@ -1963,9 +2009,17 @@ bool MtpDrafter::draft_first(int T, const float *R_row, int32_t token,
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
     strata::mtp_ctx_check("draft_first R_row", R_row, dev_queue());
+    // Row from the other card's arena: staged through plain host memory (cross_usm_probe T9a/T10).
+    const float* row_src = R_row;
+    static thread_local std::vector<float> xrow;
+    if (sycl::queue* oq = strata::mtp_foreign_owner(R_row, dev_queue())) {
+        if (xrow.size() < (size_t)HCN) xrow.resize((size_t)HCN);
+        oq->memcpy(xrow.data(), R_row, (size_t)HCN * sizeof(float)).wait();
+        row_src = xrow.data();
+    }
     for (int t = 0; t < T; ++t)
         if (DPCT_CHECK_ERROR(dev_queue().memcpy(
-                (void *)(window_R_ + (size_t)t * HCN), R_row,
+                (void *)(window_R_ + (size_t)t * HCN), row_src,
                 (size_t)HCN * sizeof(float)).wait()) != 0) {
             err = "mtp: staging the first residual failed";
             return false;
