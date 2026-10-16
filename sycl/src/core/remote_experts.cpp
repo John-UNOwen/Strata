@@ -204,13 +204,41 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                "free memory", err, device)) {
         close(); return false;
     }
-    uint64_t needed = 0;
-    for (const auto& pair : selected)
-        needed += lay.native ? (lay.blob_bytes(pair.first) + 255) / 256 * 256 : lay.max_blob;
+    if (free_bytes == 0 && total_bytes > (3ull << 30)) {
+        // 0 with a known total means the driver does not know (expert_cache.cpp #1545); the Linux side there
+        // sizes from the DRM fdinfo, which Windows has not.  This card is dedicated to the tier and the
+        // process holds nothing on it yet, so size from the total less an allowance for the context,
+        // staging and the WDDM reservations.
+        std::fprintf(stderr, "strata generate: CUDA%d experts: no free-memory report from the driver; sizing from %.2f GiB total with a 2 GiB allowance\n",
+                     device, (double) total_bytes / 1073741824.0);
+        free_bytes = total_bytes - (2ull << 30);
+    }
     // Leave room for the CUDA context, staging and later driver allocations, especially under WDDM.
-    if (needed + (512ull << 20) > free_bytes) {
-        err = "CUDA" + std::to_string(device) + " experts: slots leave less than 512 MiB free; reduce --expert-cache-device" + std::to_string(device);
+    // windows port 2026-10-15: --expert-cache-device1 auto asks for every unclaimed pair; upstream sizes the
+    // tier to the card, this build only gated on the total and refused the run.  Shrink the selection to what
+    // fits, keeping the ranking.
+    uint64_t needed = 0;
+    const uint64_t cap = free_bytes > (512ull << 20) ? free_bytes - (512ull << 20) : 0;
+    std::vector<std::pair<int32_t, int32_t>> fit;
+    fit.reserve(selected.size());
+    for (const auto& pair : selected) {
+        const uint64_t b = lay.native ? (lay.blob_bytes(pair.first) + 255) / 256 * 256 : lay.max_blob;
+        if (needed + b > cap) break;
+        needed += b;
+        fit.push_back(pair);
+    }
+    if (fit.size() < selected.size())
+        std::fprintf(stderr, "strata generate: CUDA%d experts: the card fits %zu of %zu requested slots (%.2f GiB arena)\n",
+                     device, fit.size(), selected.size(), (double) needed / 1073741824.0);
+    selected.swap(fit);
+    if (selected.empty()) {
+        err = "CUDA" + std::to_string(device) + " experts: no room for even one expert slot; reduce --expert-cache-device" + std::to_string(device);
         close(); return false;
+    }
+    sizes.clear();
+    if (lay.native) {
+        sizes.reserve(selected.size());
+        for (const auto& pair : selected) sizes.push_back((int64_t) lay.blob_bytes(pair.first));
     }
     const bool cache_ok = lay.native ? cache_.open_sized(sizes, layers, experts, err)
                                      : cache_.open((int64_t) selected.size(), layers, experts,
