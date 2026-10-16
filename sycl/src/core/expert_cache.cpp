@@ -86,17 +86,6 @@ size_t device_free_bytes() try {
                 std::fprintf(stderr, "strata: the driver reports no free card memory (xe without ext_intel_free_memory); sizing from the DRM fdinfo (this process holds %.2f GiB)\n", (double) own / 1073741824.0);
             free_b = (size_t) (total_b - own);
         }
-#elif defined(_WIN32)
-    // The same #1545 signature on Windows (the Arc drivers there expose no ext_intel_free_memory).  Windows has
-    // no DRM fdinfo to ask who holds what, and the cards Strata sizes on this path are dedicated to one process,
-    // so size from the total less an allowance for the context and driver reservations.  The ExpertCache guard
-    // and the allocation itself still bound the run.
-    if (free_b == 0 && total_b > (3ull << 30)) {
-        static std::atomic<bool> said{false};
-        if (!said.exchange(true))
-            std::fprintf(stderr, "strata: the driver reports no free card memory (Windows Arc without ext_intel_free_memory); sizing from the %.2f GiB total with a 1 GiB allowance\n", (double) total_b / 1073741824.0);
-        free_b = (size_t) (total_b - (1ull << 30));
-    }
 #endif
     // #1440: own_drm_local_bytes() sums every DRM fd of the process, i.e. both cards on a layer split, and would charge the
     // first card's cache to the second. With more than one GPU it runs only where the driver reports the whole card as

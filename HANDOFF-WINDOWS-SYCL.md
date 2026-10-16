@@ -73,17 +73,13 @@ The cause: a 12 GB card holds ~11% of the experts, so the CPU (AVX2, 9-11 pool w
 | `9ec1997`, `0433d9f` | CMake: `-fsycl-device-code-split=off` on Windows (per-kernel split made sycl-post-link take 41 min, then run out of memory); link `mkl_sycl_blas_dll`; `/fp:precise` instead of `-fp-model=precise` |
 | `c7acd7f` | +4 KiB tail slack on pinned/polled host buffers (verify, session, mtp, expert sources) |
 | `072fc0d` | `LINKER:/MAP` link map (Windows only since the review fix) |
-| `4857f1d`, `2f205be` | "no free-memory report" fallbacks in `expert_cache.cpp` / `remote_experts.cpp` (Windows only). With `--expert-cache-device1 auto`, `remote_experts` shrinks the tier to fit, as the CUDA engine does; an explicit slot count that does not fit still refuses |
+| `4857f1d`, `2f205be` | "no free-memory report" fallbacks in `expert_cache.cpp` / `remote_experts.cpp` (since dropped, fix item 2). With `--expert-cache-device1 auto`, `remote_experts` shrinks the tier to fit, as the CUDA engine does; an explicit slot count that does not fit still refuses |
 | review fix | `/MAP` gated on `WIN32`; the `remote_experts` fallback gated on `_WIN32` and the shrink gated on `auto`, so the Linux and explicit-count paths match upstream again |
 
 ## 6. Fix list (do these first)
 
 1. ~~`LINKER:/MAP` outside `if(WIN32)` broke the Linux link.~~ Fixed: it is inside `if(WIN32)` now.
-2. **The free-memory fallbacks (`4857f1d`, `2f205be`) assume the card is empty** (`total - 1 GiB`, `total - 2 GiB`). On this PC that is how VRAM gets overcommitted: the desktop sits on the A770, and VicGPT's server may still be running. Windows Level Zero **does** report free memory here (the log says "6.80 GiB free"), so these paths may never be needed.
-   - Prefer: drop them.
-   - Or: require an explicit per-card env figure. The WSL experiment used `STRATA_WSL_FREE_MIB="11000,14000"` for this.
-   - This matters most for the two-card split (step 2): on the A770, which drives the desktop (~0.6-1 GB used), the fallback would assume 14 of 16 GiB free.
-   - Still open. Both fallbacks now run on Windows only.
+2. ~~The free-memory fallbacks (`4857f1d`, `2f205be`) assumed the card was empty (`total - 1 GiB`, `total - 2 GiB`).~~ Dropped: Windows Level Zero reports free memory on this PC (the log says "6.80 GiB free"), and on the A770, which drives the desktop, the guess would have assumed 14 of 16 GiB free. If a driver ever reports 0, the cache is sized from 0 and the second-card tier refuses, as upstream does.
 3. **The `+4096` tail slack hides a real out-of-bounds read.** Host code (the reference gemv, the pool kernels) reads past the end of these buffers. Linux has the same bug; it is just masked there. Find the reader and bound it, or at least file it upstream.
 4. **`fd_pread` serializes.** `CreateFileA` is called without `FILE_FLAG_OVERLAPPED`, so Windows serializes I/O on the handle, and the "several threads pread one handle" design (mirror pool, prompt stagers) runs one read at a time.
    - Open with `FILE_FLAG_OVERLAPPED` and wait per call (event in the OVERLAPPED, or `GetOverlappedResult`), or open one handle per thread.
@@ -100,12 +96,20 @@ The cause: a 12 GB card holds ~11% of the experts, so the CPU (AVX2, 9-11 pool w
 
 ## 7. Next development steps (in order)
 
-1. **Fix list items 2 and 6** (safety and correctness), then commit. Item 1 is done.
-2. **Two-card split, A770 + B580.** This is the main lever: it gives ~26 GB of VRAM instead of ~11, so many more experts on the GPU.
-   - Build with JIT (item 5) and set `ONEAPI_DEVICE_SELECTOR=level_zero:0,1` with `--layer-split auto`.
-   - Under WSL+OpenCL the auto split judged the A770 much faster (64 vs 20 compute units). It gave the B580 only layers 0-1 and left 15,781 experts host-served.
-   - Try explicit `--layer-split N` values. Watch the log lines "layer split, CUDA1 ... room for experts", "experts of the later stages are not in VRAM", and the hit rate.
-   - Expect the A770 path to be slower per expert: it has no ahead-of-time kernels and no coopmat.
+1. **Fix list item 6** (config), then commit. Items 1 and 2 are done.
+2. **Two-card split, B580 + A770.** This is the main lever: ~26 GB of VRAM instead of ~11, so many more experts on the GPU.
+   - **Build (JIT, both cards).** Same configure command as `build-sycl-aot`, in a new directory and without AOT: `-B build-sycl-jit -DSTRATA_SYCL_AOT= -DSTRATA_SYCL_PARITY=OFF`, then `cmake --build build-sycl-jit --target strata`. One build cannot hold both AOT targets: the grouped XMX kernels have one shape per build (sub-group 8 for the A770, 16 for the B580). In the JIT build the B580 skips them (`STRATA_PF_XMX` is ignored there) and uses the other kernels. `STRATA_SYCL_JIT_STATELESS` stays ON: without it the A770 misreads expert caches past 4 GiB (`docs/INTEL.md`).
+   - **First start compiles every kernel for both cards** (about 47 s for one card on Linux; expect longer here: two devices, and one module per file on Windows). That is CPU time, not GPU memory. If the first compile crashes, set `SYCL_CACHE_PERSISTENT=0` (it crashed on Xe2 on Linux).
+   - **Config:** copy `strata-iq2_xs-win.json` to `strata-iq2_xs-2card.json` and change:
+     - `ONEAPI_DEVICE_SELECTOR=level_zero:0,1`. The B580 is the first stage, the A770 the last. The last stage runs the head, the draft layer and the verify, so the faster card goes last (`serve/server.py`, `ordered_gpus`).
+     - `--layer-split 18` in `args` (layers 0-17 on the B580, 18-47 on the A770). Then try 14 and 22, one change per run. Not `auto`: under WSL it gave the B580 only layers 0-1.
+     - `--max-context 32768`.
+     - The engine path: `build-sycl-jit\strata.exe`.
+     - An `--expert-profile` must be in `args`: a split across cards refuses to start without one.
+     - Optional: `STRATA_STAGE_TRIM=1` in `env`. Each card then loads only its own layers' dense weights and gives the rest to its expert cache. It is opt-in upstream, and the output can differ slightly.
+   - **Run it as before:** VicGPT's server closed, launched by the user, Task Manager open. Watch **both** cards' shared and dedicated memory now. The A770 also carries the desktop, so its stop line is dedicated memory near ~15 GB (not measured; scaled from the B580's 11.3 of 12).
+   - **Read in the log:** "layer split across 2 GPUs", each stage's experts in VRAM, "experts of the later stages are neither in VRAM nor mirrored", and the decode hit rate. Record prompt and decode t/s for each K beside section 4's numbers.
+   - Expect each card to be slower per expert than in an AOT build: the kernels are JIT-compiled, and the B580 has no XMX prompt kernels in this build.
 3. **Prompt speed.**
    - Look into why the prompt path computes on the CPU ("too few cache slots to borrow").
    - Measure `fd_pread` with overlapped I/O (item 4).

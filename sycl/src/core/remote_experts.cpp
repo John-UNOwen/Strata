@@ -204,17 +204,6 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                "free memory", err, device)) {
         close(); return false;
     }
-#if defined(_WIN32)
-    if (free_bytes == 0 && total_bytes > (3ull << 30)) {
-        // 0 with a known total means the driver does not know (expert_cache.cpp #1545); the Linux side there
-        // sizes from the DRM fdinfo, which Windows has not.  This card is dedicated to the tier and the
-        // process holds nothing on it yet, so size from the total less an allowance for the context,
-        // staging and the WDDM reservations.
-        std::fprintf(stderr, "strata generate: CUDA%d experts: no free-memory report from the driver; sizing from %.2f GiB total with a 2 GiB allowance\n",
-                     device, (double) total_bytes / 1073741824.0);
-        free_bytes = total_bytes - (2ull << 30);
-    }
-#endif
     // Leave room for the CUDA context, staging and later driver allocations, especially under WDDM.
     uint64_t needed = 0;
     if (auto_size) {
