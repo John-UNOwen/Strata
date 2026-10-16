@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <cstdlib>
+#include <memory>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -476,6 +478,11 @@ public:
     std::lock_guard<mutex_type> lock(m_mutex);
     init_queues();
   }
+  // Strata (Windows layer split): the device in a context it shares with the other GPUs of its platform (dev_mgr)
+  device_ext(const sycl::device &base, const sycl::context &ctx) : sycl::device(base), _ctx(ctx) {
+    std::lock_guard<mutex_type> lock(m_mutex);
+    init_queues();
+  }
 
   int is_native_atomic_supported() { return 0; }
   int get_major_version() const {
@@ -846,24 +853,60 @@ public:
 
 private:
   mutable std::recursive_mutex m_mutex;
+  // Strata: one SYCL context for the GPUs of a platform instead of one per device.  Host USM belongs to the context
+  // it was allocated in, and the engine allocates the buffers both cards of a layer split read (the stages' hand-off,
+  // the expert mirror) through one card's queue.  On Linux the other card reads them anyway; on Windows (WDDM) it is
+  // only guaranteed for the context's own devices, and B580 + A770 hung or failed in the later stage's first layer
+  // (HANDOFF section 16).  Default: shared on Windows, per device elsewhere (unchanged).  STRATA_SYCL_SHARED_CONTEXT=1
+  // or =0 overrides.  One visible GPU makes the same one-device context either way.
+  static bool shared_gpu_context() {
+    if (const char *e = std::getenv("STRATA_SYCL_SHARED_CONTEXT"))
+      return e[0] == '1';
+#if defined(_WIN32)
+    return true;
+#else
+    return false;
+#endif
+  }
   dev_mgr() {
     sycl::device default_device =
         sycl::device(sycl::default_selector_v);
-    _devs.push_back(std::make_shared<device_ext>(default_device));
-
     std::vector<sycl::device> sycl_all_devs =
         sycl::device::get_devices(sycl::info::device_type::all);
-    // Collect other devices except for the default device.
-    if (default_device.is_cpu())
-      _cpu_device = 0;
-    for (auto &dev : sycl_all_devs) {
-      if (dev == default_device) {
-        continue;
+    std::vector<sycl::device> order{default_device};
+    for (auto &dev : sycl_all_devs)
+      if (dev != default_device)
+        order.push_back(dev);
+    // a shared context for each platform's GPUs (when asked and there are two or more); none: per device as before
+    std::vector<std::shared_ptr<sycl::context>> ctx_of(order.size());
+    if (shared_gpu_context()) {
+      for (size_t i = 0; i < order.size(); ++i) {
+        if (ctx_of[i] || !order[i].is_gpu())
+          continue;
+        std::vector<sycl::device> group;
+        std::vector<size_t> at;
+        for (size_t j = i; j < order.size(); ++j)
+          if (!ctx_of[j] && order[j].is_gpu() &&
+              order[j].get_platform() == order[i].get_platform()) {
+            group.push_back(order[j]);
+            at.push_back(j);
+          }
+        if (group.size() < 2)
+          continue;
+        try {
+          auto ctx = std::make_shared<sycl::context>(group);
+          for (size_t j : at)
+            ctx_of[j] = ctx;
+        } catch (const sycl::exception &) {
+          // the runtime refused the shared context: those devices keep their own, as before
+        }
       }
-      _devs.push_back(std::make_shared<device_ext>(dev));
-      if (_cpu_device == -1 && dev.is_cpu()) {
-        _cpu_device = _devs.size() - 1;
-      }
+    }
+    for (size_t i = 0; i < order.size(); ++i) {
+      _devs.push_back(ctx_of[i] ? std::make_shared<device_ext>(order[i], *ctx_of[i])
+                                : std::make_shared<device_ext>(order[i]));
+      if (_cpu_device == -1 && order[i].is_cpu())
+        _cpu_device = (int) i;
     }
 #ifdef DPCT_HELPER_VERBOSE
     list_devices();

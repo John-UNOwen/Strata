@@ -329,3 +329,41 @@ Latent, not on the engine's paths as far as traced: `kernels/cuda/qsa.dp.cpp` `s
 **Run 4 attempt 1 (00:45, `0,7000`): the engine refused the split (not the fault - sizing did its job).** `CUDA1 ... 4.27 GiB free` then `room for experts 0.00 GiB` / `CUDA1 expert cache: no room`. Two findings from it: (1) the sizing floor for a CUDA1 stage is above 4.27 GiB minus the reserve, so the slack control must stay near the working figure - the config is now `0,11000` (expected room ~3.6 GiB, still several GiB of real slack on the card); (2) **a new engine bug for the fix list**: on the `no room` path `strata.exe` does not exit cleanly - it crashes with an access violation `0xc0000005` in `ur_loader.dll` (Application Error #1000 at 00:45:46). Worth tracing whatever device/queue teardown the "no room" path performs through the UR loader.
 
 **Run 4 attempt 2 (00:48, `0,11000`, `strata-iq2_xs-2card-nomtp-p4096-lowfree.log`): stalled identically - VRAM pressure ruled out.** The A770 stage took only 2656 slots / 3.63 GiB (vs 4086 / 5.58 in run 2), leaving ~8 GiB of real slack on the card, and the end was the same: two windows captured, `timed out at layer 18`, TDR `#4101` at 00:50:14. The full post-fix elimination list: card (C), graph support (probes), adapter generation (v1/v2), the per-device statics (fixed, rebuilt - did not fix), concurrent prefill stage thread + cross-card prefill waits (run 2), prefill hand-off in general (run 3 crossed it in eager), eager vs captured verify (both fail), VRAM pressure on the A770 (run 4). What survives: **the CUDA1-stage verify execution in a two-device process** (captured: hang at layer 18 + TDR; eager: error 40 + TDR). **Run 5 attempt (00:53, swapped selector): the swap is not reachable through env knobs on this PC - use an engine knob instead.** `ONEAPI_DEVICE_SELECTOR=level_zero:1;level_zero:0` does NOT reorder (docs confirm: the selector filters by index, order comes from the adapter); the engine still got `GPU 0: B580`, so `STRATA_VRAM_FREE_MIB=11000,0` starved the A770 at index 1 - `no room` refusal + the known `ur_loader.dll` crash (second reproduction of that defect). Probe `C:\strata-deps\sycl_dev_list.cpp` (built with the libmmd-free recipe) mapped the enumeration: baseline UR order is [B580, A770, UHD770] per adapter, and the Arc pair appears TWICE in the raw list (v1 and v2 adapters both expose them - matches the stall dumps loading both adapter DLLs). `ZE_AFFINITY_MASK` indexes the **native ze order, which is reversed vs the UR indices**: mask `0` keeps [A770, UHD770], mask `1` keeps [B580]. So: UR index 0 = B580 while ze device 0 = A770. Any code path that mixes the two orders on this PC would target the wrong card - worth checking in the fix work. To actually run the role swap, the engine needs a small knob (stage 0's device is hardwired to the first visible one; `--split-device` only assigns the later stages) - or physically swap the PCIe slots. Run 5 therefore goes to the fix agent's plate along with: role-swap result still OPEN (role vs card not yet separated).
+
+## 16. Review of runs 1-5 (2026-10-16): one SYCL context per card
+
+**The surviving symptom points at memory the A770 reads but does not own.** After runs 1-4, only the CUDA1-stage verify work in a two-device process still fails. Captured: hang at the stage's first layer + TDR. Eager: error 40 + TDR. The same work passes on either card alone.
+
+**Cause found in the vendored dpct (`sycl/include/dpct/device.hpp`):**
+- `device_ext` builds **its own one-device `sycl::context`** (`_ctx(*this)`), so every card's queues live in a separate context.
+- Host USM belongs to the context it was allocated in. The engine allocates buffers that both cards read through one card's queue (the current device at allocation time, normally CUDA0):
+  - the verify stages' hand-off rows (`generate.cpp`, `sycl::malloc_host(hb, dpct::get_in_order_queue())`; the A770 stage reads them as its first layer's input);
+  - the expert mirror chunks the copy kernels read (`gguf_expert_source.cpp`; the A770 stage's `pcie_frac 0.48` reads them);
+  - the prefill hand-off.
+- SYCL does not guarantee such a pointer on another context's device.
+  - Linux evidently lets the other card read it, so the Linux two-card runs worked.
+  - Under WDDM, residency is per device. That fits an A770 that hangs on its first layer's reads.
+  - A `memcpy` from such memory still works (the driver treats it as plain host memory). That is why the prefill hand-offs, which are copies, mostly crossed fine, and the kernels that read the memory in place did not.
+- **The graph probe could not catch this:** it built one context for both cards (`sycl::context{devs}`), unlike the engine.
+
+Checked and ruled out:
+- No engine code mixes the UR and native Level Zero device orders (no `zeDeviceGet`; `copy_queue.cpp` takes native handles from the SYCL device).
+- The only queue built outside dpct (`copy_queue.cpp`) uses dpct's context.
+
+**Fix in this commit:**
+- `dev_mgr` builds **one context for all GPUs of a platform** and gives it to each `device_ext`.
+- Default: on for Windows, off elsewhere, so Linux is unchanged. `STRATA_SYCL_SHARED_CONTEXT=1` or `=0` overrides.
+- With one GPU visible (the single-card configs) the context holds the same one device as before.
+- If the runtime refuses the shared context, the devices keep their own as before.
+- Not built here (no oneAPI in this container).
+
+**Run 6 (user-launched): the run-2 config** (`start-2c-nomtp-p4096.bat`: graphs on, `--prefill 4096`, `STRATA_PREFILL_HELP_FRAC=0`) **on the rebuilt engine.**
+- Watch Task Manager as before, but expect one change: with a shared context the host USM buffers can be mapped for both cards, so **"shared GPU memory" may now rise on the A770 too**. That is pinned system RAM made visible to the card, not a VRAM overcommit.
+- Judge it against **dedicated** memory and Windows RAM. If shared memory rises well past ~0.2 GB and you are unsure, stop and record the figures; that is information too.
+
+Reading the result:
+- **Decodes several windows:** the context was the fault. Then the default config: drop `--prefill 4096` and `STRATA_PREFILL_HELP_FRAC=0`, then `--mtp`, then speeds for `--layer-split 18 / 14 / 22`.
+- **Same failure:** re-run with `STRATA_SYCL_SHARED_CONTEXT=0`. If the log is identical, the fix did not take effect; check the build. If it differs, compare.
+- The role-swap knob (section 15, run 5) is only worth building if run 6 fails.
+
+**Still open, separate:** the `ur_loader.dll` access violation on the "no room" exit path (two reproductions). It is likely teardown order: queues and contexts destroyed after the UR loader unloads, at static destruction. Not looked at yet.
