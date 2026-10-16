@@ -8,11 +8,26 @@ web app as the CUDA engine. Written for and measured on an Arc B580 (12 GB) + Ar
 ## What works today
 
 - **Single card**: B580 alone or A770 alone, full 64K-128K context serving.
-- **Two Arc cards, mixed generations**: a layer split (default: B580 layers 0-10 with all its experts in VRAM, A770
-  layers 11-47 with a 9.6 GiB expert cache, the rest streamed from RAM through the CPU). Measured IQ2_XS:
-  **~35.5 tokens/s decode**, prompt reads 621 tokens/s (4K) / 851 tokens/s (16K), 64K context.
+- **Two Arc cards, mixed generations, the 22/26 layer split** (`--layer-split 22`, called k22): B580 layers 0-21,
+  A770 layers 22-47. Reliable for text and for pictures (the vision encoder runs on the CPU). Measured IQ2_XS at
+  64K context: **18-25 tokens/s decode**, prompt reads 260-320 tokens/s, drafts accepting up to ~86% on good
+  prompts. 128K context also starts and serves.
+- **Deeper A770-heavy splits are the open frontier**: a 32-layer A770 side (split16) ran text-only clean but NaNs as
+  soon as pictures enter; the 37-layer side (split11) NaNs text at 64K and at 32K. See the fault-shape update under
+  caveats - the frontier tracks how many layers the Alchemist card holds, not chunk size or staging.
 - Built-in drafts (speculation windows, `--spec 4`) work on all of these. The optional MTP drafter is **parked on
   the two-card Windows path** (see caveats).
+
+## Run
+
+Daily launchers in the repo root (port 8081 for the Arc configs):
+
+| Bat | Setup |
+| --- | --- |
+| `start-2card-k22-ctx64k.bat` | the daily default: k22 split, 64K, text |
+| `start-2card-k22-ctx128k.bat` | the same split at 128K context |
+| `start-strata-k22-vision.bat` | k22 with pictures on the CPU encoder (the clean image fallback) |
+| `start-strata-split11.bat`, `start-strata-split11-ctx32k.bat`, `start-strata-split16*.bat` | split-search probes, currently the unstable class |
 
 ## Build
 
@@ -29,17 +44,7 @@ compiles with `-ze-opt-greater-than-4GB-buffer-required` and is clean). An AOT `
 alternative launch build for B580-only setups. Prepend `%MKLROOT%\bin` to PATH or strata.exe dies with a missing-DLL
 exit (setvars.bat omits it).
 
-## Run
-
-Daily launchers in the repo root (port 8081 for the Arc configs):
-
-| Bat | Setup |
-| --- | --- |
-| `start-strata-split11.bat` | the default: B580 + A770, 64K context, no MTP |
-| `start-strata-split11-ctx32k.bat` | same split at 32K context (roomier VRAM) |
-| `start-strata-split16.bat` | a deeper split variant (B580 layers 0-15) |
-
-The config JSONs next to them carry the engine env. The pieces the two-card run needs:
+The config JSONs next to the launchers carry the engine env. The pieces the two-card run needs:
 
 ```
 "ONEAPI_DEVICE_SELECTOR": "level_zero:0;level_zero:1",
@@ -58,11 +63,17 @@ The config JSONs next to them carry the engine env. The pieces the two-card run 
 
 - **Keep VRAM headroom.** Watch shared GPU memory and each card's dedicated use; a screen flicker (Windows TDR) means
   a card reset - stop, lower context or cache. Do not run two engines at once.
-- **Big arenas on the A770 are the open frontier.** Its expert-cache arena is one allocation over 4 GiB. The JIT path
-  copes, and 32K-context runs stage no GEMM operand past 4 GiB at all; the 64K path (8192-token prompt chunks) has a
-  known standing issue class here, tracked with its fix window in
-  [HANDOFF-WINDOWS-SYCL.md](../HANDOFF-WINDOWS-SYCL.md) and the bench handoffs. For today: split11 at 64K is the
-  measured daily setup.
+- **The open frontier tracks how many layers the Alchemist card holds.** Up to 26 layers on the A770 (k22) is
+  reliable for text and pictures; from 32 layers the split starts producing all-NaN windows (text-only at 37, text
+  then pictures at 32). The earlier "one big arena past 4 GiB" reading did not survive the split search: clean k22
+  runs stage GEMM operands past 4 GiB, and split16 NaNs on requests that stage nothing past it. Per-op staging is
+  neither necessary nor sufficient as the explanation. The fault shape is tracked in
+  [HANDOFF-WINDOWS-SYCL.md](../HANDOFF-WINDOWS-SYCL.md) and `bench/results/`. Once a session has served a
+  non-finite window, every later request on that server stays garbage (fast, fake speeds) until a restart.
+- **Debug scans can hide the fault.** In 2 of 2 split11 runs the synchronous `STRATA_DBG_NAN` scans changed timing
+  enough that the run looked clean. Gate fault conclusions on normal launchers without debug env (N>=3).
+- **`--prefill auto:N` snaps back to 8192** for any N below it; to actually run 4096-token chunks, ask for the
+  fixed `--prefill 4096`.
 - **MTP (the optional drafter) is parked on Windows two-card runs.** In every clean measurement (single card, both
   cards) MTP drafts matched or lost to the built-in drafts, and the engine's own draft auto-disable turned them off
   and ran faster on the A770. On the two-card split the MTP path also carries an unresolved NaN hunt documented in

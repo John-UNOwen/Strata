@@ -54,7 +54,10 @@ Intel Arc on Windows (built from source, engine 0.1.44.1, IQ2_XS, measured 2026-
 | --- | ---: | ---: |
 | Arc B580 (12 GB) alone | 10 tokens/s | ~100 tokens/s |
 | Arc A770 (16 GB) alone | 14-21 tokens/s | 90-130 tokens/s |
-| Arc B580 + Arc A770 (two cards, layers split) | 35 tokens/s | 620-850 tokens/s |
+| Arc B580 + Arc A770 (two cards, 22/26 layer split) | 18-25 tokens/s | 260-320 tokens/s |
+
+The two-card split also reads pictures (the picture work runs on the processor). Deeper splits that give the A770
+more layers measured faster in short tests but are a known open problem today: [Intel Arc on Windows](docs/INTEL_WINDOWS.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
@@ -78,7 +81,7 @@ Experimental, written and tested by community members on their own machines:
 - **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
 - **Intel Arc on Windows** (Arc A770 / A750 and Arc B580, one engine build per card generation): built from source
   with Intel oneAPI 2026.1, not part of the installer. One card works; two Arc cards (mixing A-series and B-series is
-  fine) split the model's layers between them and are the fastest Intel setup, measured above. Start here:
+  fine) split the model's layers between them, and the 22/26 split reads text and pictures reliably today. Start here:
   [Intel Arc on Windows](docs/INTEL_WINDOWS.md) (keep 1-2 GB of VRAM free per card; the JIT kernel build is required
   on Arc; the extra guess-and-check helper model is parked for two-card runs, so Intel two-card setups use the
   built-in drafts instead).
