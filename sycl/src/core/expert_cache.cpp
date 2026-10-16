@@ -115,8 +115,9 @@ static size_t stated_free_bytes(size_t total_b) {
     uint64_t budget = 0, usage = 0;
     if (!dxgi_local_memory(name, budget, usage)) {
         if (say)
-            std::fprintf(stderr, "strata: CUDA%d reports no free memory, and DXGI has no single adapter named \"%s\" to "
-                                 "count this process's use of it; STRATA_VRAM_FREE_MIB is not used for it\n", dev, name.c_str());
+            std::fprintf(stderr, "strata: CUDA%d reports no free memory, and DXGI has no adapter named \"%s\", or "
+                                 "several that report different memory, to count this process's use of it; "
+                                 "STRATA_VRAM_FREE_MIB is not used for it\n", dev, name.c_str());
         return 0;
     }
     const uint64_t stated = std::min<uint64_t>((uint64_t) mib[(size_t) dev] << 20, total_b);

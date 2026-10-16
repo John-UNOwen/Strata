@@ -314,10 +314,14 @@ int arena_pin_cap_gib() {
 
 #ifdef _WIN32
 namespace {
-// Calls f(adapter) for the one DXGI adapter whose description is `name` (win_dxgi.hpp); false when none or several
-// have it, or DXGI is not there.
-template <class F>
-bool with_adapter_named(const std::string& name, F&& f) {
+// The account of one memory segment group of the card named `name` (win_dxgi.hpp), and the first matching adapter's
+// LUID.  A name can match several adapters: the Intel driver registers an Arc A770 as two WDDM adapters (two LUIDs,
+// one PCI device, the same accounting: both read 2.01 GiB used after a 2 GiB allocation, 2026-10-16), and two
+// identical cards share a name too.  DXGI cannot tell those cases apart, but the reader needs only the account: when
+// every match reports the same budget and usage, the answer is the same whichever adapter is the card.  Matches that
+// disagree (two identical cards in use) are refused.  One retry covers an allocation landing between two reads.
+bool agreed_account(const std::string& name, DXGI_MEMORY_SEGMENT_GROUP group, uint64_t& budget, uint64_t& usage,
+                    LUID* luid) {
     const int wlen = MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, nullptr, 0);
     if (wlen <= 1 || wlen > 255) return false;
     wchar_t wname[256] = {};
@@ -327,49 +331,53 @@ bool with_adapter_named(const std::string& name, F&& f) {
     using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
     const auto create = (CreateFactory) (void*) GetProcAddress(dxgi, "CreateDXGIFactory1");
     IDXGIFactory1* factory = nullptr;
-    IDXGIAdapter1* match = nullptr;
-    int matches = 0;
+    bool ok = false;
     if (create != nullptr && SUCCEEDED(create(__uuidof(IDXGIFactory1), (void**) &factory)) && factory != nullptr) {
-        for (UINT i = 0;; ++i) {
-            IDXGIAdapter1* a = nullptr;
-            if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND || a == nullptr) break;
-            DXGI_ADAPTER_DESC1 d{};
-            if (SUCCEEDED(a->GetDesc1(&d)) && lstrcmpW(d.Description, wname) == 0 && ++matches == 1) { match = a; continue; }
-            a->Release();
+        for (int attempt = 0; attempt < 2 && !ok; ++attempt) {
+            int matches = 0;
+            bool agree = true;
+            for (UINT i = 0; agree; ++i) {
+                IDXGIAdapter1* a = nullptr;
+                if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND || a == nullptr) break;
+                DXGI_ADAPTER_DESC1 d{};
+                IDXGIAdapter3* a3 = nullptr;
+                DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+                if (SUCCEEDED(a->GetDesc1(&d)) && lstrcmpW(d.Description, wname) == 0) {
+                    if (FAILED(a->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &a3)) || a3 == nullptr ||
+                        FAILED(a3->QueryVideoMemoryInfo(0, group, &info))) {
+                        agree = false;
+                    } else if (++matches == 1) {
+                        budget = info.Budget; usage = info.CurrentUsage;
+                        if (luid != nullptr) *luid = d.AdapterLuid;
+                    } else {
+                        agree = info.Budget == budget && info.CurrentUsage == usage;
+                    }
+                    if (a3 != nullptr) a3->Release();
+                }
+                a->Release();
+            }
+            ok = agree && matches >= 1;
         }
         factory->Release();
     }
-    const bool ok = matches == 1 && f(match);
-    if (match != nullptr) match->Release();
     FreeLibrary(dxgi);
     return ok;
 }
 }  // namespace
 
 bool dxgi_local_memory(const std::string& device_name, uint64_t& budget, uint64_t& usage) {
-    return with_adapter_named(device_name, [&](IDXGIAdapter1* a) {
-        IDXGIAdapter3* a3 = nullptr;
-        if (FAILED(a->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &a3)) || a3 == nullptr) return false;
-        DXGI_QUERY_VIDEO_MEMORY_INFO info{};
-        const bool ok = SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info));
-        a3->Release();
-        if (ok) { budget = info.Budget; usage = info.CurrentUsage; }
-        return ok;
-    });
+    return agreed_account(device_name, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, budget, usage, nullptr);
 }
 #endif
 
 namespace {
 #ifdef _WIN32
-// The pinned device's LUID, which gpu_shared_memory_budget needs (see with_adapter_named).
+// The pinned device's LUID, which gpu_shared_memory_budget needs: the first adapter of the device's name, when every
+// adapter of that name reports the same shared (non-local) segment - the one that budget reads (see agreed_account).
 bool current_device_luid(LUID& out) {
     const std::string name = dpct::get_in_order_queue().get_device().get_info<sycl::info::device::name>();
-    return with_adapter_named(name, [&](IDXGIAdapter1* a) {
-        DXGI_ADAPTER_DESC1 d{};
-        if (FAILED(a->GetDesc1(&d))) return false;
-        out = d.AdapterLuid;
-        return true;
-    });
+    uint64_t budget = 0, usage = 0;
+    return agreed_account(name, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, budget, usage, &out);
 }
 // #243: how much of the arena the sliced registration may pin on Windows when the whole arena was refused.
 // Page-locked memory the GPU maps is charged to its shared (non-local) WDDM segment; pinned slice by slice until

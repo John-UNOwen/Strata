@@ -144,7 +144,7 @@ Four findings made it work; the first two are committed:
    - **Review fix (2026-10-16):**
      - The figure is free MiB **before Strata starts**, by device index after `ONEAPI_DEVICE_SELECTOR` (the N of "CUDAN" in the log).
      - On every read, DXGI's `QueryVideoMemoryInfo` (this process's usage of that card) is taken off it, capped by the OS budget for the process. A fixed figure used to make every after-allocation check pass.
-     - Without a single DXGI adapter of the device's name (two identical cards, or no DXGI), the variable is not used for that card, and the log says so. The pinned arena's LUID lookup needs a unique name now too, instead of taking the first match.
+     - The device is found among the DXGI adapters by name. If none has it, or the adapters of that name report different memory (two identical cards in use), the variable is not used for that card, and the log says so. Several adapters that report the same figures are accepted (section 11).
      - Anything but numbers, spaces and commas disables the variable with one message. `0;13000` used to hang the parser and fill RAM.
      - The variable is Windows-only now; Linux keeps its DRM-fdinfo fallback.
      - The split search uses `device_free_bytes()` only when the driver reports 0, so Linux splits size as before.
@@ -158,7 +158,7 @@ Unchanged open work for whoever continues: measure prompt/decode t/s for `--laye
 
 ## 10. Status of the two-card launch (2026-10-16, after `d5b2875`)
 
-Section 9's startup success no longer holds on `d5b2875`: the rebuilt engine exits at ~20 s with `layer split, CUDA1: 0.00 GiB free of 15.56, room for experts 0.00 GiB` then `layer split, CUDA1 expert cache: no room` (B580 stages normally, 5607 slots). **Do not launch `start-strata-2card.bat` until section 11 is fixed.** The build itself is clean - `pinned.dp.cpp` (DXGI code) and `expert_cache.cpp` compile without errors (only the usual dpct unused-function warnings); the failure is runtime, and the config/env are correct as listed.
+Section 9's startup success no longer holds on `d5b2875`: the rebuilt engine exits at ~20 s with `layer split, CUDA1: 0.00 GiB free of 15.56, room for experts 0.00 GiB` then `layer split, CUDA1 expert cache: no room` (B580 stages normally, 5607 slots). **Fixed in the commit after `849f1e8` (section 11); launch only after rebuilding with it.** The build itself is clean - `pinned.dp.cpp` (DXGI code) and `expert_cache.cpp` compile without errors (only the usual dpct unused-function warnings); the failure is runtime, and the config/env are correct as listed.
 
 ## 11. Regression in `d5b2875`: the A770 answers twice in DXGI
 
@@ -166,4 +166,10 @@ Section 9's startup success no longer holds on `d5b2875`: the rebuilt engine exi
 - **On this PC DXGI enumerates the A770 twice**: adapter 0 `Intel(R) Arc(TM) A770 Graphics` LUID 0:81183457 and adapter 3 the same name, LUID 0:130438 - same DeviceId 0x56A0, same dedicated 15.88 GiB, same WDDM accounting. WMI shows one PCI device (`VEN_8086&DEV_56A0`): the Intel driver registers two WDDM render adapters for the one physical card. So `matches == 2`, not 0: the guard prints "no single adapter named..." and the stated figure is discarded - free 0, zero slots, engine refuses the split.
 - Measured with two probes (sources + compile lines at `C:\strata-deps\dxgi_probe.cpp`, `C:\strata-deps\dxgi_l0_probe.cpp`; run the latter with `ONEAPI_DEVICE_SELECTOR=level_zero:1`): after a 2 GiB `sycl::malloc_device` + fill on the A770, **both** duplicates show **usage 2.01 GiB** (budget 15.13 GiB): the shrink mechanism is sound - Level Zero allocations ARE counted, and the duplicates report the same card identically. Only the adapter selection is wrong.
 - Same guard also backs `current_device_luid` / `sliced_pin_limit` (pinned.dp.cpp): on the A770 they silently fall back (`sliced_pin_limit` to RAM/2 - 8 GiB).
-- Direction for the fix (not applied here): among same-name matches, treat duplicates as the same card when their accounts agree (equal VendorId/DeviceId/dedicated memory - here byte-for-byte) and use the first; only genuinely differing same-name adapters (two identical physical cards) stay ambiguous - say so in the comment, as section 7 item 5 already asked. With the selection fixed, the first run must show the "STRATA_VRAM_FREE_MIB 13000 MiB less this process's X GiB" lines, X growing to ~the cache size - section 9's first-run check.
+- **Fix (`agreed_account`, pinned.dp.cpp):**
+  - Every adapter with the device's name is read for the segment the caller needs (local for `STRATA_VRAM_FREE_MIB`, non-local for the pinned arena's LUID).
+  - If they all report the same budget and usage, the first one is used: the answer is then the same whichever adapter is the card. This covers the A770's duplicate.
+  - If they differ, the read is refused (fail closed). One retry covers an allocation landing between two reads.
+  - Equal VendorId/DeviceId/memory size was not used: two identical physical cards have those equal too, but their usage differs once the engine uses both.
+  - Not measured: whether the two A770 adapters also agree on the non-local (shared) segment. If not, `sliced_pin_limit` falls back to RAM/2 - 8 GiB as before. The pinned device there is CUDA0 (the B580) anyway.
+- **First-run check (unchanged):** the "STRATA_VRAM_FREE_MIB 13000 MiB less this process's X GiB" lines, X growing to ~the cache size (section 9).
