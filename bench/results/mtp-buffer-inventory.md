@@ -47,7 +47,14 @@ Startup order: draft head load (137.9 MiB) -> 2078 MiB free -> captures fine -> 
 3. `STRATA_MTP_CHECK_CTX=1` assert: before each submit, `sycl::get_pointer_device(ptr)` vs queue device for every USM pointer (mapped file views will report host device - keep them on the Phase 3 probe #0 list instead).
 4. Never `dpct::get_in_order_queue()` inside `MtpDrafter` without `OnDevice(device_)` active (mtp.hpp:241 default still points at the default queue until load).
 
-## Open CHECKs for Phase 1 (quick)
+## What Phase 0 changed about the theory
+The WIP (`dev_queue()`) already moved every DRAFTER-owned buffer to A770, and the k22 WIP runs still died in `mtp.prefill` - so the fault is an INPUT handed to the drafter across contexts (FLAG #1 first). That narrows Phase 2 to the prefill input staging rather than a broad refactor.
 - Confirm `Verifier::init` line 530 sits inside the `OnDevice(device_)` scope that starts near verify.cpp:328.
 - Confirm `side_` usage sites (mtp.cpp:1020-1042) run under `OnDevice(device_)`.
 - Confirm the KV catch-up loop ranges (generate.cpp:7692 area).
+
+## CHECK results (settled same session)
+- `Verifier::init` (verify.cpp:462): its call sites in generate.cpp:7253, 7306, 7360 each hold `const OnDevice on(gs.dev)` around init, so the verifier window staging/payload buffers (including the `final_R` rows) belong to the STAGE's own card. The drafter (A770) reading the last stage's rows is same-context. OK.
+- `side_` (mtp.cpp:1020-1042): used inside the graph-capture region whose head carries `const OnDevice on_device(device_)` (mtp.cpp:722), and `side_` itself is created on the drafter's device (mtp.cpp:523). OK for the capture path; keep an eye on any non-capture use.
+- Remaining hard suspects: FLAG #1 (`sp.on_chunk` -> `mtp.prefill(R_rows,...)`, the multi-GPU token path taken by BOTH warmup and every prompt chunk - the exact death zone) and FLAG #2 (`SessionLoopScratch::y_miss`, allocated on the default B580 queue at generate.cpp:5907-5915; verify which stage's kernels read it via the `copy_from_mapped(parts_out,...)` sites at verify.cpp:1476-1487).
+- Nuance for Phase 2: two host allocation flavors coexist. `host_malloc_polled` = uncached plain host memory with +4 KiB slack (mtp.cpp:97, verify.cpp:241 when `window_host_uncached()`); `sycl::malloc_host` = USM (verify.cpp:242 else-branch). The T3 probe only proved **USM** corruption across contexts. All non-mtp split paths read many polled-host buffers from both cards fine, which suggests polled-host pages map per-device correctly while USM does not. Phase 3 probe #1 should test BOTH flavors A770 -> B580 to confirm this asymmetry - if it holds, the cheap uniform fix is: cross-card shared buffers become `host_malloc_polled` on the READER's device (or host-staged copies), and `sycl::malloc_host` usage is confined to one-card contexts. The `STRATA_MTP_CHECK_CTX=1` assert plus a `get_pointer_device` printout at the `mtp.prefill` entry will name the exact offender on the first warmup step.
