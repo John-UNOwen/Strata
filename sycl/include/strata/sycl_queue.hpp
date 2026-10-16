@@ -54,9 +54,11 @@ inline void big_fill_zero(sycl::queue& q, void* p, size_t bytes, size_t chunk = 
 #endif
 #include <cstdlib>
 #include <cstdio>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <vector>
 namespace strata {
 namespace detail {
 inline std::unordered_set<void*>& uncached_set() { static std::unordered_set<void*> s; return s; }
@@ -78,32 +80,68 @@ inline void* host_malloc_polled(size_t bytes, sycl::queue& q) {
 #endif
     return sycl::malloc_host(bytes, q);
 }
-// STRATA_MTP_CHECK_CTX=1: name every pointer whose USM owner differs from the queue it is used on (the two-card
-// mtp faults: a kernel or a queue memcpy touching another context's host USM).  Diagnostics only, never fatal.
+// STRATA_MTP_CHECK_CTX=1: classify every pointer an mtp path touches against the queue that uses it.
+// A consumer context can only see its own USM: foreign DEVICE memory reports usm::alloc::unknown (and querying its
+// owner through that context throws), so unknown pointers are additionally scanned against every SYCL device context
+// to name the true owner.  Diagnostics only, never fatal.
 inline bool mtp_ctx_check_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_MTP_CHECK_CTX");
-        return v != nullptr && *v != '0';
+        return v != nullptr && v[0] == '1';
     }();
     return on;
 }
 inline void mtp_ctx_check(const char* what, const void* p, sycl::queue& q) {
     if (!mtp_ctx_check_on() || p == nullptr) return;
     static std::mutex mu;
-    static std::unordered_set<std::string> seen;
+    static std::unordered_set<std::string> seen;   // (site, pointer): distinct pointers report separately
     std::lock_guard<std::mutex> lk(mu);
-    if (!seen.insert(what).second) return;   // one report per site: the sites are fixed strings
+    const std::string key = std::string(what) + '@' +
+        std::to_string(reinterpret_cast<uintptr_t>(p));
+    bool fresh = seen.insert(key).second;
+    if (!fresh) return;
+    auto type_name = [](sycl::usm::alloc t) {
+        switch (t) {
+            case sycl::usm::alloc::device: return "device USM";
+            case sycl::usm::alloc::host: return "host USM";
+            case sycl::usm::alloc::shared: return "shared USM";
+            default: return "not visible in this context";
+        }
+    };
     try {
         const auto t = sycl::get_pointer_type(p, q.get_context());
-        if (t == sycl::usm::alloc::unknown) {
-            std::fprintf(stderr, "CTXCHECK %s: pointer is not USM in this context (native or plain host)\n", what);
+        if (t != sycl::usm::alloc::unknown) {
+            const sycl::device owner = sycl::get_pointer_device(p, q.get_context());
+            std::fprintf(stderr, "CTXCHECK %s: %s; owner=%s queue=%s %s\n", what, type_name(t),
+                         owner.get_info<sycl::info::device::name>().c_str(),
+                         q.get_device().get_info<sycl::info::device::name>().c_str(),
+                         owner == q.get_device() ? "(same device)" : "(DIFFERENT DEVICE)");
             return;
         }
-        const sycl::device owner = sycl::get_pointer_device(p, q.get_context());
-        std::fprintf(stderr, "CTXCHECK %s: %s context; owner=%s queue=%s\n", what,
-                     owner == q.get_device() ? "own" : "FOREIGN",
-                     owner.get_info<sycl::info::device::name>().c_str(),
-                     q.get_device().get_info<sycl::info::device::name>().c_str());
+        // Unknown here: either plain host memory or a buffer owned by another context.  Scan every SYCL device.
+        static std::vector<std::pair<sycl::device, sycl::context>> all;
+        if (all.empty()) {
+            for (const sycl::device& d : sycl::device::get_devices()) {
+                if (d.get_info<sycl::info::device::device_type>() == sycl::info::device_type::cpu) continue;
+                sycl::queue probe_q(d);
+                all.emplace_back(d, probe_q.get_context());
+            }
+        }
+        std::string owners;
+        for (auto& dc : all) {
+            try {
+                const auto ot = sycl::get_pointer_type(p, dc.second);
+                if (ot != sycl::usm::alloc::unknown) {
+                    owners += type_name(ot);
+                    owners += " on ";
+                    owners += dc.first.get_info<sycl::info::device::name>();
+                }
+            } catch (const sycl::exception&) {}
+        }
+        std::fprintf(stderr, "CTXCHECK %s: %s; queue=%s%s\n", what, type_name(t),
+                     q.get_device().get_info<sycl::info::device::name>().c_str(),
+                     owners.empty() ? " (no GPU context owns it: plain host or native memory)"
+                                    : ("; owned: " + owners).c_str());
     } catch (const sycl::exception&) {}
 }
 
