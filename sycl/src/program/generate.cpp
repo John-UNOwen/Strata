@@ -1701,6 +1701,18 @@ int main(int argc, char **argv) try {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // a C++ exception that reaches std::terminate (no catch, or thrown while unwinding) aborted the process with
+    // no text (0xC0000409); print what was in flight first
+    std::set_terminate([] {
+        std::cerr << "strata: std::terminate";
+        if (std::exception_ptr ep = std::current_exception()) {
+            try { std::rethrow_exception(ep); }
+            catch (const std::exception &x) { std::cerr << ": " << x.what(); }
+            catch (...) { std::cerr << ": non-std exception"; }
+        }
+        std::cerr << std::endl;
+        std::abort();
+    });
 #if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
     // AMD, a file-backed arena (STRATA_ARENA_MMAP): ROCclr copies a pageable source of 1 MiB or more by locking its
     // pages in place (a GPU userptr), and keeps them - so every expert the VRAM fill copied from the mapped
@@ -13078,5 +13090,14 @@ int main(int argc, char **argv) try {
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+catch (std::exception const &exc) {
+  // not a SYCL error: without this catch it escaped main and aborted the process (0xC0000409) with no text
+  std::cerr << "strata: C++ exception: " << exc.what() << " (" << __FILE__ << ":" << __LINE__ << ")" << std::endl;
+  std::exit(1);
+}
+catch (...) {
+  std::cerr << "strata: unknown C++ exception (" << __FILE__ << ":" << __LINE__ << ")" << std::endl;
   std::exit(1);
 }

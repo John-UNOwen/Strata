@@ -165,6 +165,8 @@ public:
     }
 
 private:
+    /// The in-order queue of device_ (the drafter's own card), not the default device's (see mtp.cpp).
+    sycl::queue& dev_queue() const;
     bool record_forward(int T, int step_row0, dpct::queue_ptr cs,
                         std::string &err);
     /// The layer's front for T rows at step rows [row0, +T): the embedding, the fc projections, the attention

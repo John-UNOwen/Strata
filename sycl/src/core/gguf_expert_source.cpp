@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #if defined(_WIN32)
@@ -25,22 +26,39 @@ namespace strata::core {
 namespace {
 constexpr size_t kRing = 512;   // blobs alive at once: the prompt path holds a layer's worth of streamed experts
 
-// Windows port: fds_ carries a HANDLE as an int (handles are 32-bit safe). A ReadFile with an
-// OVERLAPPED offset is a positioned read: the same handle can be pread from several threads, as
-// mirror()'s pool and the prompt stager threads do.
+// Windows port: fds_ carries a HANDLE as an int (handles are 32-bit safe). The handle is opened
+// FILE_FLAG_OVERLAPPED: on a synchronous handle Windows serializes every ReadFile on the file object,
+// so mirror()'s pool and the prompt stager threads read one at a time. Overlapped, each thread's read
+// is its own request; the caller still waits for it (a per-thread event), so fd_pread stays a pread.
+// STRATA_SYNC_PREAD=1 opens the handles synchronous again (the A/B arm).
 #if defined(_WIN32)
 int fd_open(const std::string& path) {
+    static const bool sync_read = [] { const char* e = std::getenv("STRATA_SYNC_PREAD"); return e && *e == '1'; }();
     const HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+                                 FILE_ATTRIBUTE_NORMAL | (sync_read ? 0 : FILE_FLAG_OVERLAPPED), nullptr);
     return h == INVALID_HANDLE_VALUE ? -1 : (int) (intptr_t) h;
 }
 void fd_close(int fd) { if (fd >= 0) CloseHandle((HANDLE) (intptr_t) fd); }
 ssize_t fd_pread(int fd, void* dst, size_t n, int64_t off) {
+    struct Event {   // one manual-reset event per thread, reused for every read it makes
+        HANDLE h = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        ~Event() { if (h) CloseHandle(h); }
+    };
+    thread_local Event ev;
+    if (ev.h == nullptr) return -1;
+    const HANDLE h = (HANDLE) (intptr_t) fd;
     OVERLAPPED ov{};
     ov.Offset = (DWORD) (off & 0xffffffffll);
     ov.OffsetHigh = (DWORD) ((off >> 32) & 0xffffffffll);
+    ov.hEvent = ev.h;   // without an event, completion would signal the handle every thread shares
+    const DWORD want = (DWORD) std::min<size_t>(n, (size_t) 1 << 30);   // callers loop on short reads
     DWORD got = 0;
-    if (!ReadFile((HANDLE) (intptr_t) fd, dst, (DWORD) n, &got, &ov)) return -1;
+    if (!ReadFile(h, dst, want, nullptr, &ov)) {
+        const DWORD e = GetLastError();
+        if (e == ERROR_HANDLE_EOF) return 0;
+        if (e != ERROR_IO_PENDING) return -1;
+    }
+    if (!GetOverlappedResult(h, &ov, &got, TRUE)) return GetLastError() == ERROR_HANDLE_EOF ? 0 : -1;
     return (ssize_t) got;
 }
 #else

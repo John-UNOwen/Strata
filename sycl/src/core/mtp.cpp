@@ -54,6 +54,13 @@
 #endif
 
 namespace strata::core {
+
+// Two cards: the drafter runs on device_ (its last stage), so its buffers and queue must come from that device, not
+// the default one (device 0).  Single card: device_ is the default device, so this is the same queue as before.
+sycl::queue& MtpDrafter::dev_queue() const {
+    const OnDevice on_device(device_);
+    return dpct::get_in_order_queue();
+}
 namespace {
 
 constexpr float EPS = 1e-6f;
@@ -81,14 +88,14 @@ struct Bump {
     }
 };
 
-bool mapped(size_t bytes, void **h, void **d) try {
+bool mapped(size_t bytes, void **h, void **d, sycl::queue &q) try {
     /*
     DPCT1048: The original value cudaHostAllocMapped is not meaningful in the
     migrated code and was removed or replaced with 0. You may need to check the
     migrated code.
     */
     if (DPCT_CHECK_ERROR(*h = strata::host_malloc_polled(
-                             bytes + 4096, dpct::get_in_order_queue())) !=
+                             bytes + 4096, q)) !=
         0 || *h == nullptr) return false;   // the host polls what the draft steps write: uncached host memory (sycl_queue.hpp); + slack for their read-ahead (windows page-tight allocations)
     std::memset(*h, 0, bytes + 4096);
     return DPCT_CHECK_ERROR(*d = (void *)*h) == 0;
@@ -137,38 +144,38 @@ MtpDrafter::~MtpDrafter() {
     if (cs_) cs_->wait();
     for (auto &e : prefill_exec_) if (e) delete (e);
     for (auto &e : prefill_dev_exec_) if (e) delete (e);
-    if (pf_dev_) sycl::free(pf_dev_, dpct::get_in_order_queue());
-    if (dense4_) sycl::free(dense4_, dpct::get_in_order_queue());
+    if (pf_dev_) sycl::free(pf_dev_, dev_queue());
+    if (dense4_) sycl::free(dense4_, dev_queue());
     for (auto &e : round_exec_) if (e) delete (e);
     for (auto &e : step_exec_) if (e) delete (e);
     for (auto &e : round_exec_c_) if (e) delete (e);
     for (auto &e : step_exec_c_) if (e) delete (e);
-    if (cparams_) sycl::free(cparams_, dpct::get_in_order_queue());
-    if (cring_) sycl::free(cring_, dpct::get_in_order_queue());
-    if (dinv_) sycl::free(dinv_, dpct::get_in_order_queue());
-    if (cscratch_) sycl::free(cscratch_, dpct::get_in_order_queue());
-    if (h_cparams_) sycl::free(h_cparams_, dpct::get_in_order_queue());
-    if (h_chist_) sycl::free(h_chist_, dpct::get_in_order_queue());
+    if (cparams_) sycl::free(cparams_, dev_queue());
+    if (cring_) sycl::free(cring_, dev_queue());
+    if (dinv_) sycl::free(dinv_, dev_queue());
+    if (cscratch_) sycl::free(cscratch_, dev_queue());
+    if (h_cparams_) sycl::free(h_cparams_, dev_queue());
+    if (h_chist_) sycl::free(h_chist_, dev_queue());
     if (cs_) dpct::get_current_device().destroy_queue(cs_);
     if (side_) dpct::get_current_device().destroy_queue(side_);
     if (sh_fork_) dpct::destroy_event(sh_fork_);
     if (sh_join_) dpct::destroy_event(sh_join_);
-    if (owns_weights_ && dense_) sycl::free(dense_, dpct::get_in_order_queue());
+    if (owns_weights_ && dense_) sycl::free(dense_, dev_queue());
     if (owns_weights_ && experts_)
-        sycl::free(experts_, dpct::get_in_order_queue());
-    if (state_arena_) sycl::free(state_arena_, dpct::get_in_order_queue());
-    if (arena_) sycl::free(arena_, dpct::get_in_order_queue());
-    if (head_logits_) sycl::free(head_logits_, dpct::get_in_order_queue());
+        sycl::free(experts_, dev_queue());
+    if (state_arena_) sycl::free(state_arena_, dev_queue());
+    if (arena_) sycl::free(arena_, dev_queue());
+    if (head_logits_) sycl::free(head_logits_, dev_queue());
     if (owns_draft_head_ && dhead_) {
       strata::kernels::native_q6_k_unpack(dhead_);
-      sycl::free(dhead_, dpct::get_in_order_queue());
+      sycl::free(dhead_, dev_queue());
     }
     if (owns_draft_head_ && dvocab_)
-        sycl::free(dvocab_, dpct::get_in_order_queue());
+        sycl::free(dvocab_, dev_queue());
     if (ev_chain_) dpct::destroy_event(ev_chain_);
     for (dpct::event_ptr e : ev_step_) if (e) dpct::destroy_event(e);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_};
-    for (void *h : hosts) if (h) strata::host_free_polled(h, dpct::get_in_order_queue());
+    for (void *h : hosts) if (h) strata::host_free_polled(h, dev_queue());
 }
 
 const float* MtpDrafter::f32(const char* name) const {
@@ -214,9 +221,9 @@ bool MtpDrafter::make_q4_dense(const std::vector<uint8_t>& blob, std::string& er
         }
         q4_off_.push_back({t->name, off});
     }
-    dense4_ = (uint8_t*) strata::malloc_device_guarded((size_t) total, dpct::get_in_order_queue());   // SYCL port: cudaMalloc/cudaMemcpy
+    dense4_ = (uint8_t*) strata::malloc_device_guarded((size_t) total, dev_queue());   // SYCL port: cudaMalloc/cudaMemcpy
     if (dense4_ == nullptr) { err = "mtp: the Q4_0 projections do not fit"; return false; }
-    dpct::get_in_order_queue().memcpy(dense4_, host.data(), (size_t) total).wait();
+    dev_queue().memcpy(dense4_, host.data(), (size_t) total).wait();
     vram_ += total;
     std::fprintf(stderr, "strata mtp: --mtp-q4: %zu projections as Q4_0 (%.1f MiB)\n", plan.size(), (double) total / 1048576.0);
     return true;
@@ -235,7 +242,7 @@ bool MtpDrafter::make_q4_head(std::string& err) {
     if (tt == nullptr || tt->to_float == nullptr || N % 32 != 0) { err = "mtp: --mtp-q4 cannot read the head's format"; return false; }
     const size_t in_row = head_->row_bytes(), out_row = (size_t) (N / 32) * 18;
     std::vector<uint8_t> src((size_t) n_dvocab_ * in_row), dst((size_t) n_dvocab_ * out_row);
-    try { dpct::get_in_order_queue().memcpy(src.data(), dhead_, src.size()).wait(); }   // SYCL port: cudaMemcpy
+    try { dev_queue().memcpy(src.data(), dhead_, src.size()).wait(); }   // SYCL port: cudaMemcpy
     catch (sycl::exception const&) { err = "mtp: reading the draft head"; return false; }
     std::vector<float> row((size_t) N);
     for (int64_t r = 0; r < n_dvocab_; ++r) {
@@ -243,7 +250,7 @@ bool MtpDrafter::make_q4_head(std::string& err) {
         ggml_quantize_chunk(GGML_TYPE_Q4_0, row.data(), dst.data() + (size_t) r * out_row, 0, 1, N, nullptr);
     }
     // the Q4_0 rows replace the subset in place (they are smaller)
-    try { dpct::get_in_order_queue().memcpy(dhead_, dst.data(), dst.size()).wait(); }
+    try { dev_queue().memcpy(dhead_, dst.data(), dst.size()).wait(); }
     catch (sycl::exception const&) { err = "mtp: writing the draft head"; return false; }
     dhead_type_ = GGML_Q4_0;
     std::fprintf(stderr, "strata mtp: --mtp-q4: draft head over %lld tokens as Q4_0 (%.1f MiB read per step, was %.1f)\n",
@@ -299,7 +306,7 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
         if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
         const dpct::err0 alloc =
             DPCT_CHECK_ERROR(dense_ = (uint8_t *)strata::malloc_device_guarded(
-                                 blob.size(), dpct::get_in_order_queue()));
+                                 blob.size(), dev_queue()));
         /*
         DPCT1000: Error handling if-stmt was detected but could not be
         rewritten.
@@ -330,7 +337,7 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
                              : "unknown");
             return false;
         }
-        dpct::get_in_order_queue().memcpy(dense_, blob.data(), blob.size()).wait();
+        dev_queue().memcpy(dense_, blob.data(), blob.size()).wait();
         vram_ += blob.size();
         if (q4_ && !make_q4_dense(blob, err)) return false;
     }
@@ -346,7 +353,7 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
             ~Closer() { if (f != nullptr) std::fclose(f); }
         } closer{f};
         if (DPCT_CHECK_ERROR(experts_ = (uint8_t *)strata::malloc_device_guarded(
-                                 bytes, dpct::get_in_order_queue())) != 0) {
+                                 bytes, dev_queue())) != 0) {
             err = "mtp: the 512 experts do not fit in VRAM"; return false;
         }
 #if !defined(_WIN32)
@@ -356,7 +363,7 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
             if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
-            dpct::get_in_order_queue()
+            dev_queue()
                 .memcpy(experts_ + off, chunk.data(), n)
                 .wait();
             off += n;
@@ -383,7 +390,7 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (DPCT_CHECK_ERROR(state_arena_ = (void *)strata::malloc_device_guarded(
-                             sb, dpct::get_in_order_queue())) != 0) {
+                             sb, dev_queue())) != 0) {
         err = "mtp: the K/V state does not fit"; return false;
     }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
@@ -393,12 +400,12 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
         DPCT1026: The call to cudaGetLastError was removed because this
         functionality is redundant in SYCL.
         */
-        sycl::free(state_arena_, dpct::get_in_order_queue());
+        sycl::free(state_arena_, dev_queue());
         st_ = QsaState{};
         ring = -1;   // fully resident
         sb = qsa_state_bytes(g, max_cells, false, ring);
         if (DPCT_CHECK_ERROR(state_arena_ = (void *)strata::malloc_device_guarded(
-                                 sb, dpct::get_in_order_queue())) != 0) {
+                                 sb, dev_queue())) != 0) {
             err = "mtp: the K/V state does not fit"; return false;
         }
         if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) { err = "mtp: state init failed"; return false; }
@@ -416,13 +423,13 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
     const uint64_t R2 = 2 * T;   // step/pos rows: T catch-up rows + up to T-2 chain steps
-    bool ok = mapped(T * 4 + 64, (void**) &h_tok_, (void**) &m_tok_) &&
-              mapped(R2 * 4 * 4 + 64, (void**) &h_step_, (void**) &m_step_) &&
-              mapped(R2 * NH * 4 + 64, (void**) &h_pos_, (void**) &m_pos_) &&
-              mapped(64, (void**) &h_row_, (void**) &m_row_) &&
-              mapped(T * 4 + 64, (void**) &h_out_, (void**) &m_out_) &&
-              mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_) &&
-              (!force_on_ || mapped(64, (void**) &h_force_, (void**) &m_force_));
+    bool ok = mapped(T * 4 + 64, (void**) &h_tok_, (void**) &m_tok_, dev_queue()) &&
+              mapped(R2 * 4 * 4 + 64, (void**) &h_step_, (void**) &m_step_, dev_queue()) &&
+              mapped(R2 * NH * 4 + 64, (void**) &h_pos_, (void**) &m_pos_, dev_queue()) &&
+              mapped(64, (void**) &h_row_, (void**) &m_row_, dev_queue()) &&
+              mapped(T * 4 + 64, (void**) &h_out_, (void**) &m_out_, dev_queue()) &&
+              mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_, dev_queue()) &&
+              (!force_on_ || mapped(64, (void**) &h_force_, (void**) &m_force_, dev_queue()));
     if (!ok) { err = "mtp: mapped staging failed"; return false; }
     if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;
     auto carve = [&](Bump& b) {
@@ -458,10 +465,10 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
     Bump count;
     carve(count);
     if (DPCT_CHECK_ERROR(arena_ = (void *)strata::malloc_device_guarded(
-                             count.used, dpct::get_in_order_queue())) != 0) {
+                             count.used, dev_queue())) != 0) {
         err = "mtp: buffers do not fit"; return false;
     }
-    strata::big_fill_zero(dpct::get_in_order_queue(), arena_, count.used);
+    strata::big_fill_zero(dev_queue(), arena_, count.used);
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
@@ -476,7 +483,7 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
         If the memory is not pageable, call wait() on event return by memcpy API
         to ensure synchronization behavior.
         */
-        dpct::get_in_order_queue().memcpy(ident_, id.data(), id.size() * 4).wait();
+        dev_queue().memcpy(ident_, id.data(), id.size() * 4).wait();
     }
     // --pipeline-windows 2 (the forcing graphs): the chain shares its card with stage 1's windows and the next launch
     // on stage 0 waits for it, so its stream gets the highest priority there (STRATA_MTP_PRIORITY=0: the default)
@@ -559,7 +566,7 @@ void MtpDrafter::record_top2(int j) try {
     if ((int64_t) lg_host_.size() < nv) lg_host_.resize((size_t) nv);
     if ((int) top2_.size() < max_t_) top2_.assign((size_t) max_t_, -1);
     if (j < 0 || j >= max_t_) return;
-    if (DPCT_CHECK_ERROR(dpct::get_in_order_queue()
+    if (DPCT_CHECK_ERROR(dev_queue()
                              .memcpy(lg_host_.data(), head_logits_,
                                      (size_t)nv * sizeof(float))
                              .wait()) != 0) {
@@ -605,14 +612,14 @@ bool MtpDrafter::setup_coupled(std::string& err) try {
                              "argmax drafts\n", (long long) nv);
         return true;
     }
-    sycl::queue& q = dpct::get_in_order_queue();
+    sycl::queue& q = dev_queue();
     const size_t ring = (size_t) (kCoupledHistCap + max_t_) * sizeof(int32_t);
     cparams_ = sycl::malloc_device<strata::kernels::SamplerParams>(1, q);
     cring_ = (int32_t*) sycl::malloc_device(ring, q);
     cscratch_ = sycl::malloc_device(scratch, q);
     if (cparams_ == nullptr || cring_ == nullptr || cscratch_ == nullptr ||
-        !mapped(sizeof(strata::kernels::SamplerParams), (void**) &h_cparams_, (void**) &m_cparams_) ||
-        !mapped((size_t) kCoupledHistCap * sizeof(int32_t), (void**) &h_chist_, (void**) &m_chist_)) {
+        !mapped(sizeof(strata::kernels::SamplerParams), (void**) &h_cparams_, (void**) &m_cparams_, dev_queue()) ||
+        !mapped((size_t) kCoupledHistCap * sizeof(int32_t), (void**) &h_chist_, (void**) &m_chist_, dev_queue())) {
         err = "mtp: the coupled draft sampler's buffers do not fit";
         return false;
     }
@@ -723,7 +730,7 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
     if (head_logits_ == nullptr &&
         DPCT_CHECK_ERROR(head_logits_ = sycl::malloc_device<float>(
                              (size_t)max_t_ * (size_t)n_vocab_,
-                             dpct::get_in_order_queue())) != 0) {
+                             dev_queue())) != 0) {
         err = "mtp: the draft logits do not fit";
         return false;
     }
@@ -746,17 +753,17 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
             if (DPCT_CHECK_ERROR(dvocab_ = (int32_t *)sycl::malloc_device(
-                                     raw.size(), dpct::get_in_order_queue())) !=
+                                     raw.size(), dev_queue())) !=
                     0 ||
                 DPCT_CHECK_ERROR(dhead_ = (uint8_t *)sycl::malloc_device(
                                      (size_t)(n_dvocab_ * row_bytes),
-                                     dpct::get_in_order_queue())) != 0 ||
+                                     dev_queue())) != 0 ||
                 dvocab_ == nullptr || dhead_ == nullptr) {   // Level Zero returns null when the VRAM is full
                 err = "mtp: the draft head does not fit";
                 draft_head_hint(n_dvocab_, row_bytes);
                 return false;
             }
-            dpct::get_in_order_queue().memcpy(dvocab_, raw.data(), raw.size()).wait();
+            dev_queue().memcpy(dvocab_, raw.data(), raw.size()).wait();
             dvocab_host_.resize((size_t) n_dvocab_);
             std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
             strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
@@ -1315,12 +1322,12 @@ bool MtpDrafter::prepare_prefill(std::string &err) try {
     const OnDevice on_device(device_);
     const int64_t per_row = 1 + 4 + g_->n_head;
     if (pf_cap_ < (int64_t) max_t_ * per_row) {
-        if (pf_dev_) sycl::free(pf_dev_, dpct::get_in_order_queue());
+        if (pf_dev_) sycl::free(pf_dev_, dev_queue());
         pf_dev_ = nullptr;
         pf_cap_ = 0;
         if (DPCT_CHECK_ERROR(pf_dev_ = sycl::malloc_device<int32_t>(
                                  (size_t)(max_t_ * per_row),
-                                 dpct::get_in_order_queue())) != 0) {
+                                 dev_queue())) != 0) {
             err = "mtp prefill: the input records do not fit";
             return false;
         }
@@ -1364,12 +1371,12 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     const int64_t NHp = g_->n_head, per_row = 1 + 4 + NHp;
     if (!per_group_sync && n > 0) {
         if (pf_cap_ < n * per_row) {
-            if (pf_dev_) sycl::free(pf_dev_, dpct::get_in_order_queue());
+            if (pf_dev_) sycl::free(pf_dev_, dev_queue());
             pf_dev_ = nullptr;
             pf_cap_ = 0;
             if (DPCT_CHECK_ERROR(pf_dev_ = sycl::malloc_device<int32_t>(
                                      (size_t)(n * per_row),
-                                     dpct::get_in_order_queue())) != 0) {
+                                     dev_queue())) != 0) {
                 err = "mtp prefill: the input records do not fit";
                 return false;
             }
@@ -1951,7 +1958,7 @@ bool MtpDrafter::draft_first(int T, const float *R_row, int32_t token,
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
     for (int t = 0; t < T; ++t)
-        if (DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
+        if (DPCT_CHECK_ERROR(dev_queue().memcpy(
                 (void *)(window_R_ + (size_t)t * HCN), R_row,
                 (size_t)HCN * sizeof(float)).wait()) != 0) {
             err = "mtp: staging the first residual failed";
