@@ -78,10 +78,15 @@ endif()
 list(APPEND _sycl_flags -fsycl-default-sub-group-size=32)
 # One device module per kernel: the first launch of a kernel then loads only its own module. With the default
 # split the first launch in the prompt path (the embedding gather) paid 245 ms for the image it shared (2026-09-30).
-# Windows: sycl-post-link is single-threaded and cannot merge the per-kernel module set of this engine: 41 min of
+# Windows AOT: sycl-post-link is single-threaded and cannot merge the per-kernel module set of this engine: 41 min of
 # post-link and a merged wrapper image big enough that the wrapping pass failed with "not enough memory"
-# (2026-10-15). One module per TU keeps the Windows link tractable; the 245 ms observation is a Linux cost.
-if(WIN32)
+# (2026-10-15). One module per TU keeps the AOT link tractable; the 245 ms observation is a Linux cost.
+# Windows JIT: whole-TU modules are wrong for a different reason. The runtime JIT then compiles EVERY kernel of the
+# module, including shapes the card cannot build: an Arc A770 failed at start with "Unsupported JointMatrix
+# operation ... SG16 ... supported values: 16" on the Battlemage joint-matrix kernels it never launches
+# (2026-10-16). Per-kernel modules let it JIT only what it launches, which is how the Alchemist JIT builds
+# work on Linux.
+if(WIN32 AND STRATA_SYCL_AOT)
   list(APPEND _sycl_link -fsycl-device-code-split=off)
   list(APPEND _sycl_flags -fsycl-device-code-split=off)
 else()
