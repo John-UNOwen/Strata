@@ -47,8 +47,17 @@ Startup order: draft head load (137.9 MiB) -> 2078 MiB free -> captures fine -> 
 3. `STRATA_MTP_CHECK_CTX=1` assert: before each submit, `sycl::get_pointer_device(ptr)` vs queue device for every USM pointer (mapped file views will report host device - keep them on the Phase 3 probe #0 list instead).
 4. Never `dpct::get_in_order_queue()` inside `MtpDrafter` without `OnDevice(device_)` active (mtp.hpp:241 default still points at the default queue until load).
 
+## Probe results (`C:\strata-deps\cross_usm_probe.exe`, final version with correctly filled inputs)
+- T3: A770 kernel in-place reads B580-context `malloc_host`: **4095/4096 wrong** - silent corruption.
+- T6 (new): B580 kernel in-place reads A770-context `malloc_host`: **hard abort, exit 0xC0000409** - the same fast-fail family as the engine's death (`ucrtbase+0x7f6fe`) and its DEVICE_LOST + TDR signature. **The fault is asymmetric: reader on B580 reading A770-owned USM is fatal; reader on A770 reading B580-owned USM corrupts silently.**
+- T5: `q1.memcpy` (the runtime copy path) from a foreign-context host buffer into the reader's own device buffer: **0/4096 wrong**.
+- T8 (new, the planned `mtp.prefill` fix): host CPU `memcpy` of the foreign rows into a buffer the READING card allocated through its own queue, kernel in-place read: **0/4096 wrong**. The fix pattern is proven before writing it.
+- Earlier "T5 clean" runs were a probe artifact (unfilled input + allocator page reuse); fixed and re-verified.
+- This build has NO Level Zero linkage (`STRATA_ZE_LOADER-NOTFOUND` in the JIT CMake cache): `host_malloc_polled` falls back to `sycl::malloc_host`, so EVERY engine host buffer on this PC is USM and subject to T3/T6 semantics.
+- Theory update: the drafter WIP moved drafter-owned buffers to the A770 context (correct for drafter-side kernels), but the WIP k22 runs still died with DEVICE_LOST at `mtp.prefill` - the fatal direction (T6) says a **B580-side kernel now reads an A770-owned buffer** in that pass. Prime sites to grep: the drafter row-buffer sharing ("the drafter's own row buffer, which either parity's rows are copied into", generate.cpp:7333 area - a stage-0 (B580) parity copy writing into a drafter buffer on A770 would be exactly T6), `set_source_R` row sources, and `SessionLoopScratch::y_miss` readers (FLAG #2).
+
 ## What Phase 0 changed about the theory
-The WIP (`dev_queue()`) already moved every DRAFTER-owned buffer to A770, and the k22 WIP runs still died in `mtp.prefill` - so the fault is an INPUT handed to the drafter across contexts (FLAG #1 first). That narrows Phase 2 to the prefill input staging rather than a broad refactor.
+The WIP (`dev_queue()`) already moved every DRAFTER-owned buffer to A770, and the k22 WIP runs still died in `mtp.prefill` - so the fault is in the shared INPUT/OUTPUT rows crossing between verifier stages and the drafter, and the fatal direction (B580 reading A770-owned, per T6) points at verifier-parity copies into drafter-owned buffers. Fix template (proven by T8): the consumer copies rows through the HOST into its own context's buffer before any kernel touches them.
 - Confirm `Verifier::init` line 530 sits inside the `OnDevice(device_)` scope that starts near verify.cpp:328.
 - Confirm `side_` usage sites (mtp.cpp:1020-1042) run under `OnDevice(device_)`.
 - Confirm the KV catch-up loop ranges (generate.cpp:7692 area).
