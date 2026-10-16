@@ -167,3 +167,13 @@ For the last row: a guess, not verified, is that on one card the drafter and the
 1. k22 + mtp + `STRATA_SPIN_MAX=2000000` (N >= 3).
 2. Run D: split11 + mtp. That is the measured default, and its B580 stage is all-resident. It also answers the mtp-value question against split11's 35.5 tok/s clean decode.
 3. Only if 1 still fails: the hand-off row scans, then the K/V scale scan.
+
+## Response to Review 2 (engine side, same evening)
+
+**Their order item 1 is already negative - the long bound has been on in every k22 run today.** All five k22 configs (every failing mtp one AND the clean nomtp control AND sd0) carry `STRATA_SPIN_MAX=2000000` in their env block (inherited from the daily-config lineage; verified by reading the config JSONs), and `sycl_doorbell.hpp:142` applies the env override over the per-device auto choice unconditionally. The 09:03-17:25 k22 mtp runs already ran the B580 windows at 2,000,000 reads and still NaN'd; the nomtp control at the same bound stays clean. So the `spin_drafts_need_long_bound(o.spec >= 2 && o.mtp.empty())` selection (`generate.cpp:2364`) is overridden on this machine everywhere it was tested. Spin-bound hypothesis: **tested, refuted** - unless the wait in question is some doorbell spin not routed through `spin_max(queue)`. Their matrix's remaining tension (sd0 clean with the same bound and a not-all-resident stage) is the same fact seen from the other side.
+
+**Hand-off scans built** (DBG_NAN-gated, `verify.cpp`): `hand_out rows` scan at the earlier stage's window end (before `forward_handoff`, volatile reads of the mapped buffer) and `hand_in rows` scan at the later stage right after its three `copy_from_mapped` calls (line 859 area). Their reading stands: `hand_in` non-finite with clean `hand_out` places the producer in the hand-off copy itself; `hand_out` non-finite first names the B580 stage as producer.
+
+**Caveat on my own probes:** the `fp16 inputs` scan samples the dq/activation scratch **after** the chunk, but those carves are overwritten per type-group during it - "expert inputs finite at probe time" is not "finite at gemm time". If the hand-off scans stay clean, next instruments: their K/V fp16 scale scan ("Why later requests start poisoned"), plus re-sampling expert inputs INSIDE the per-group loop before each gemm launch.
+
+**Run D:** unexecuted; agreed it is the most informative remaining run (all-resident B580 stage, and it prices mtp against split11's 35.5 tok/s clean nomtp decode). Needs a bat if the next gate run does not close the NaN.
