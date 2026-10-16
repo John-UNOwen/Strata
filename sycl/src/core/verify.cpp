@@ -857,6 +857,17 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         copy_from_mapped(R_, hin, (int64_t) T * HC * N, cs);
         copy_from_mapped(bo_, hin + (size_t) T * HC * N, (int64_t) T * N, cs);
         copy_from_mapped(inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
+        if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the hand-off rows this stage received
+            const int64_t n = (int64_t) T * HB;
+            int64_t c = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                const float v = ((volatile float*) hin)[i];
+                uint32_t b;
+                std::memcpy(&b, &v, 4);
+                if ((b & 0x7f800000u) == 0x7f800000u) ++c;
+            }
+            if (c) std::fprintf(stderr, "strata dbg: hand_in rows: %lld non-finite of %lld\n", (long long) c, (long long) n);
+        }
     } else if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
         ne->gather_dev(tok_, T, emb_, cs);
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
@@ -2414,6 +2425,17 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
+        if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg && hand_out_ != nullptr) {   // debug: the rows this stage hands to the next
+            const int64_t n = (int64_t) hand_copy_bytes_ / 4;
+            int64_t c = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                const float v = ((volatile float*) hand_out_)[i];
+                uint32_t b;
+                std::memcpy(&b, &v, 4);
+                if ((b & 0x7f800000u) == 0x7f800000u) ++c;
+            }
+            if (c) std::fprintf(stderr, "strata dbg: hand_out rows: %lld non-finite of %lld\n", (long long) c, (long long) n);
+        }
         forward_handoff();
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
