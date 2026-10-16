@@ -2630,6 +2630,20 @@ bool Verifier::commit(int n_keep, std::string &err) try {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the window rows about to be committed
+        const ModelGeometry& g = *g_;
+        const int64_t row_f = (int64_t) g.hc * g.n_embd;
+        std::vector<float> h((size_t) last_t_ * row_f);
+        dpct::get_in_order_queue().memcpy(h.data(), R_, h.size() * 4).wait();
+        int64_t c = 0;
+        for (float v : h) {
+            uint32_t b;
+            std::memcpy(&b, &v, 4);
+            if ((b & 0x7f800000u) == 0x7f800000u) ++c;
+        }
+        if (c) std::fprintf(stderr, "strata dbg: commit rows at pos %lld: %lld non-finite of %lld (%d window rows)\n",
+                            (long long) last_pos0_, (long long) c, (long long) h.size(), last_t_);
+    }
     if (last_t_ == 1 && one_token_self_commit()) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
