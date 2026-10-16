@@ -8,9 +8,34 @@ Evidence:
 - `docs/INTEL_WINDOWS.md`;
 - KB `projects/strata-windows-sycl/`.
 
-## Where things stand
+## Where things stand (updated 18:40 by the split search; see KB split11-nan-story Update 18:40)
 
-**The baseline is now split11, not k22.** B580 layers 0-10 (all 5,632 of their experts in its VRAM), A770 layers 11-47, no MTP. `BENCH.bat`, 3 runs each, 64K context (`2ccc945`):
+**The reliable baseline is k22, not split11.** The evening ladder with real traffic (text and images) showed the fault
+tracks how many layers the A770 side holds:
+
+| A770 layers | Config | Text | With images |
+|---|---|---|---|
+| 26 | k22 | clean | clean 2/2 (even while staging GEMMs past 4 GiB) |
+| 32 | split16 | clean 3/3 | NaN (also with nothing staged past 4 GiB) |
+| 37 | split11 | NaN at 64K and at 32K | - |
+
+The split11 bench table below (621/851/35.5, commit `2ccc945`) is kept as the historical ceiling of this PC, but
+split11/split12/split16 are the **unstable class** until the >26-layer frontier is understood; measuring optimization
+arms on them mixes speed with a moving fault. **k22 daily numbers** (`start-2card-k22-ctx64k.bat`, `STRATA_VRAM_FREE_MIB=0,15000`
+now): prompt 260-320 tok/s, decode 18-25, suffix drafts up to ~86% accepted. k22 also serves images (CPU encoder,
+280-297 tok/s map prompts): at k22 the bigger B580 share no longer buys prompt speed, so the frontier costs little today.
+
+Against VicGPT's bar and the old llama.cpp Vulkan model:
+- **Prompt:** k22 benched 367 (4K) / 616 (16K) tok/s (table below), still above llama.cpp's 380-420; its map-sized
+  8-18K warm reads run 260-320. The split11-class 851 is the number the frontier hunt could restore.
+- **Decode:** k22 18-25 tok/s is about 1.2-1.5x llama.cpp's ~16.
+- **A 10k-token map chunk** reads in about 30-38 s at k22 (was 12-16 s at split11).
+
+**Arms for the k22 baseline** (`python bench/arms/make_arms_k22.py`, then `bench/arms/run-arm.bat <arm>`):
+`k22ref`, `k22mirror6000`, `k22mirror10000`, `k22prefill16k`, `k22own4096`, `k22own4096mirror`, `k22ctx32k`, `k22ctx32kmirror`.
+The old split11-based arms (`make_arms.py`) stay for the frontier hunt itself.
+
+Historical baseline table (split11 era, `2ccc945`):
 
 | Config | Prompt 4K | Prompt 16K | Decode |
 |---|---|---|---|
@@ -79,7 +104,7 @@ Against VicGPT's bar and the old llama.cpp Vulkan model:
    - **64K:** the split borrows, and `--prefill auto` caps at 8192-token chunks (`prefill_auto_max`). A 16K prompt is then two passes over the experts.
      - Arm: `--prefill auto:16384`, measured on the 16K prompt.
      - Evidence that fewer passes pay: 2048 -> 4096-token chunks gave +49% at k22 (runs 7-8), and split11 reads 16K prompts 37% faster than 4K ones.
-     - It lends more cache slots per request, so it runs into the open A770 past-4-GiB issue. Gate it on that fix.
+     - The old gate (the A770 past-4-GiB issue) was demoted by the split search: k22 stages GEMM operands past 4 GiB and stays clean. Arm `k22prefill16k` measures it directly at k22.
    - **32K:** no borrowing, so auto is forced to 2048-token chunks (`generate.cpp:2305-2307`). Arms:
      - `--prefill 4096` with own buffers: ~160 + 4096 x 680/1024 MiB + the ring per card (~3.2 GiB), taken from the expert caches for the whole session;
      - `--prefill-borrow --prefill auto`: lends during prompts only, but puts the A770's borrowed operands back into the past-4-GiB territory 32K was chosen to avoid.
@@ -98,15 +123,21 @@ Against VicGPT's bar and the old llama.cpp Vulkan model:
 
 ## Robustness
 
-6. **Teardown crash on the "no room" refusal.**
+0. **The >26-layer A770 frontier (the gate for restoring split11-class speed).** Facts on the table: clean at 26 A770
+   layers (text and images, even staging past 4 GiB), NaN at 32 (images) and 37 (text); per-op staging neither
+   necessary nor sufficient; once a session serves a non-finite window every later request stays garbage until
+   restart; the `STRATA_DBG_NAN` sync scans masked the fault in 2/2 runs, so gate conclusions on plain launchers,
+   N>=3. Evidence: KB `references/split11-nan-story-2026-10-16.md` (Update 18:40) and the probe timelines in
+   `bench/results/handoff-mtp-k22-2026-10-16.md`.
+1. **Teardown crash on the "no room" refusal.**
    - Two reproductions: the engine refuses the split (`CUDA1 expert cache: no room`, e.g. `STRATA_VRAM_FREE_MIB=0,7000`), then crashes with `0xc0000005` in `ur_loader.dll` instead of exiting cleanly.
    - Suspect: queues and contexts destroyed after the UR loader unloads, at static destruction.
    - Fix: explicit teardown before the loader unloads, or exit before the destructors run.
-7. **The A770 reports no free memory.**
+2. **The A770 reports no free memory.**
    - `ext_intel_free_memory` is unsupported there, so `STRATA_VRAM_FREE_MIB=0,13000` is needed.
    - Since `d5b2875` that figure is reduced by this process's DXGI-counted use of the card and capped by the OS budget (`expert_cache.cpp` `stated_free_bytes`).
    - A default without a stated figure could use the DXGI budget less usage directly. That needs one measured run to compare DXGI's budget with Task Manager on the A770.
-8. **The draft-head reservation on CUDA0** (`mtp_bind`, `generate.cpp:4466`) is held back on CUDA0 even on a split, where the drafter lives on the last stage. Moot while MTP is parked; fix it if MTP ever returns.
+3. **The draft-head reservation on CUDA0** (`mtp_bind`, `generate.cpp:4466`) is held back on CUDA0 even on a split, where the drafter lives on the last stage. Moot while MTP is parked; fix it if MTP ever returns.
 
 ## Environment notes (this PC, not engine)
 
