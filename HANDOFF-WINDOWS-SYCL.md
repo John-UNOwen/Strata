@@ -165,9 +165,12 @@ Section 9's startup success no longer holds on `d5b2875`: the rebuilt engine exi
 Knobs already ruled out: `STRATA_MTP_PREFILL_SYNC=1` (the old per-group loop) had no effect - both modes end up launching a graph per group (mtp.cpp:1346-1363). `STRATA_MTP_PRIORITY` is a no-op in the SYCL build: dpct drops queue priority and both branches create the same queue (mtp.cpp:483-508). Relevant port notes (docs/INTEL.md, "What the port had to get right"): every device spin is capped (`kSpinMax`), so a 10 s spin kernel is unlikely; host-to-device flag visibility *during* a kernel is unreliable on Intel; graphs are recorded in about 12 places. Suspect family: graph launch or the cross-card hand-off path on dg2 under Windows Level Zero.
 
 Isolation runs prepared (git-excluded, one variable each, separate logs; restart fully between attempts - a live process cannot survive a device loss):
-- `start-2c-nomtp.bat` / `strata-iq2_xs-2card-nomtp.json`: no `--mtp` (suffix-lookup drafter only). Tests whether mtp prefill is the hang.
-- `start-2c-b580.bat` / `strata-iq2_xs-2card-b580.json`: `--layer-split 18 --split-device 0 --conversation-cache-mib 0` (every stage runs on the B580; `--mtp` kept). Tests the cross-card hand-off and the CUDA1 side.
-Reading: nomtp ok + b580 ok = mtp prefill on CUDA1 specifically; nomtp ok + b580 hang = mtp prefill on the JIT tree generally; nomtp hang = the hang is in the prompt/graph/hand-off machinery outside mtp.
+
+**nomtp run executed (2026-10-15 22:26): mtp is not the root cause.** Without `--mtp` the prompt path ran fine, the window graphs captured cleanly on CUDA1 (`verify: captured the 4-token window (upload no error, sync no error)` x2), and the hang moved to the first decode window launch: `verify: timed out at layer 18; its GPU waits were released but the GPU did not finish within 5 s (#267)` - layer 18 is the first layer of the CUDA1 stage; the engine's per-layer stage watchdog (verify.cpp, `release_gpu_waits(5000)`) fired, then `Display #4101` at 22:27:20 killed the still-busy transaction. No host crash event this time. So both failure families sit in work executing on CUDA1 (the A770): draft prefill first, verify window after; graph capture itself succeeds.
+
+Remaining variants (both without `--mtp` now, since mtp is cleared):
+- `start-2c-nomtp.bat` (updated: `STRATA_VERIFY_EAGER=1` - the window runs on the queue instead of as a graph; verify.cpp:822). Completes -> graph launch on dg2/Windows L0 is the culprit; still times out at layer 18 -> the CUDA1 kernels/queues themselves.
+- `start-2c-b580.bat` / `strata-iq2_xs-2card-b580.json`: `--layer-split 18 --split-device 0 --conversation-cache-mib 0` (every stage runs on the B580; graphs on). Completes -> the fault is CUDA1-side (the A770 or the cross-card hand-off); times out at layer 18 again -> the split window machinery on the JIT tree itself.
 
 ## 11. Regression in `d5b2875`: the A770 answers twice in DXGI
 
