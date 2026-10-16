@@ -7,7 +7,19 @@ The probe matrix was extended to cover the real pattern (`C:\strata-deps\cross_u
 - T9b: producer-side queue memcpy, foreign dst <- own src: **also aborts**.
 - T10: two-step staging, owner queue copies device src into plain pageable host (vector) with wait, then consumer queue copies host -> its own device: **0 of 4096 values wrong**.
 Consequence: the committed fix (`37cd444`) stages foreign-device row sources exactly like T10 (`strata::mtp_foreign_owner` detection in sycl_queue.hpp; staging in prefill both paths, stage_source_R, draft_first; per-group staging drains so the staging buffer is never rewritten mid-copy). Same-context groups and single-card platforms keep the original single-hop queue copies unchanged.
-Prime suspect for the warmup death (why the original code dies without mtp staying fine): `generate.cpp:12585` `draft_first(..., ss.R, ...)` where `SessionLoopScratch::ss` (init `generate.cpp:5907-5915`, default device = B580) is a **B580 device arena** while the drafter window lives on A770 - a T9a-shaped copy. `STRATA_MTP_CHECK_CTX=1` (rewritten helper: honest type reporting, scans every GPU context to name foreign owners, dedupe per site+pointer, `1`-only env convention) now prints one CTXCHECK line per distinct pointer, including who owns it.
+## Settled 2026-10-16 08:47: the fault is the drafter's PRIVATE QUEUES on the SECOND GPU
+Evidence table (same exe with checkpoints; eager = `STRATA_MTP_NO_GRAPH=1`):
+| Drafter device | Execution | Result |
+|---|---|---|
+| 0 (default), single card | graphs | pass |
+| 0 (default), single card | eager | pass (fwd A..G, even at "0 MiB free") |
+| 0 (default), two-GPU process (`--split-device 0`) | eager | pass, mtp healthy: drafts accepted 184/250 and 227/325, suffix 117/130; decode 10.0-10.8 tok/s |
+| 1 (secondary, k22 split) | graphs | warmup hang, UR error 20 DEVICE_LOST, TDR #4101 |
+| 1 (secondary, k22 split) | eager | UR error 40 OUT_OF_RESOURCES at the FIRST submitted kernel (CTXCHECK fwd A embed gather) |
+
+Stage queues on the secondary GPU are healthy everywhere (its windows verify, it produced R_rows). Only queues created via `dpct::get_current_device().create_queue` for the secondary device misbehave. Ruled out by run: buffer ownership (all row CTXCHECKs same-device), `side_` placement (print: same context), doorbell bounds (`STRATA_SPIN_MAX=2000000`), shared branch (`STRATA_MTP_SHARED_BRANCH=0`), queue priority (`STRATA_MTP_PRIORITY=0`), graph replay itself (eager dies too), VRAM capacity (passes at 0 free single-card, fails at 2078 free on the split).
+Blind spot to attack next (flagged by the code review): `get_pointer_type`/`get_pointer_device` compare devices, not contexts, and UR USM pools look per-device, so a private queue bound to a different CONTEXT on the same secondary device would look "same device" to every check while its launches are rejected or hang. Targets: the context `dpct::device_ext::create_queue` attaches to on a non-default device, and whether the drafter should share the stage's context (or submit on the stage's in-order queue) instead of private queues.
+Interim usable configuration: `--split-device 0` + mtp (slow: B580-only decode 10-11 tok/s). The k22 A770-drafter split stays broken until the queue-binding fix.
 
 Method: read-only audit of the MTP code paths on `mtp-cross-card` (HEAD `20c693c`, drafter WIP included). No GPU run. Context column = which SYCL context the allocation belongs to: on Windows each GPU is its own platform, so "default" means CUDA0 (B580) unless an `OnDevice` guard is active at the call.
 
