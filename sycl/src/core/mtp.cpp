@@ -824,6 +824,7 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
         // ---- the two input branches
         const WeightRef* we = wt_->find("token_embd.weight");
         if (!we) { err = "mtp: token_embd.weight is missing"; return false; }
+        strata::mtp_ctx_check("record_front token_embd", we->data, *cs);
         if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
             ne->gather_dev(tok_, T, emb_, cs);
         } else {
@@ -1505,8 +1506,9 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
                 use the error codes. The cudaGetLastError function call was
                 replaced with 0. You need to rewrite this code.
                 */
-                err = std::string("mtp prefill: ") +
-                      dpct::get_error_string_dummy(0);
+                if (err.empty())
+                    err = std::string("mtp prefill: ") +
+                          dpct::get_error_string_dummy(0);
                 return false;
             }
         }
@@ -1578,8 +1580,9 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             the error codes. The cudaGetLastError function call was replaced
             with 0. You need to rewrite this code.
             */
-            err =
-                std::string("mtp prefill: ") + dpct::get_error_string_dummy(0);
+            if (err.empty())
+                err =
+                    std::string("mtp prefill: ") + dpct::get_error_string_dummy(0);
             return false;
         }
     }
