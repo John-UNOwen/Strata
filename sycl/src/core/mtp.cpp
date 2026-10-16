@@ -37,6 +37,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <unordered_set>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -821,6 +822,15 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
     const void* wp_k_proj = wq("self_attn.k_proj.weight", wt_k_proj);
     const void* wp_v_proj = wq("self_attn.v_proj.weight", wt_v_proj);
     try {
+        // Phase checkpoints (STRATA_MTP_CHECK_CTX=1, printed once each): the last line before an "mtp:"
+        // exception names the submit that failed.
+        static std::unordered_set<std::string> fwd_seen;
+        auto fwd_mark = [&](const char* phase) {
+            if (!strata::mtp_ctx_check_on()) return;
+            if (fwd_seen.insert(phase).second)
+                std::fprintf(stderr, "CTXCHECK fwd: %s\n", phase);
+        };
+        fwd_mark("A embed gather");
         // ---- the two input branches
         const WeightRef* we = wt_->find("token_embd.weight");
         if (!we) { err = "mtp: token_embd.weight is missing"; return false; }
@@ -837,6 +847,7 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
         native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
         native_quantize_q8_1(en_, xq_, (int) N, T, cs);
         native_mmvq(wt_fc_embedding, wp_fc_embedding, xq_, e2_, (int) N, (int) N, T, cs);
+        fwd_mark("B fc embedding");
         if (hnorm_stream_)   // --mtp-hnorm stream: one RMS per stream, each scaled by its slice of the weight
             native_qsa_rms_norm_grouped(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) N, (int) HC, (int) (T * HC), EPS, cs);
         else
@@ -847,6 +858,7 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
             native_mmvq(wt_fc_hidden, wp_fc_hidden, xq_, h2_ + (size_t) c0 * N, (int) N, (int) N, nc, cs);
         }
         add_streams_broadcast(h2_, e2_, R_, N, (int) HC, T, cs);
+        fwd_mark("C fc hidden + merge");
         // ---- the attention hyper-connection
         {
             FusedGrArgs fa[kFusedGrMaxT];
@@ -861,10 +873,12 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
             }
             fused_gr_read_multi(fa, T, xn_, cs);
         }
+        fwd_mark("D hyper-connection mix");
         // ---- attention: K/V into the layer's own cache
         native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
         native_mmvq(wt_k_proj, wp_k_proj, xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
         native_mmvq(wt_v_proj, wp_v_proj, xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
+        fwd_mark("E k/v projections");
         // #783 PR-d (stuchapin909): the T tokens' K norm, K/V rotation and K/V append each run once over all T rows
         // (every row is independent; the rope keeps its per-token positions). STRATA_NO_BATCH_KV_STEP=1 appends per token.
         static const bool no_batch_kv = [] {
@@ -890,6 +904,7 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
             fwht256_inplace_cuda(kcur_, (int64_t) T * NKV, cs);
             fwht256_inplace_cuda(vcur_, (int64_t) T * NKV, cs);
         }
+        fwd_mark("F k norm rope fwht");
         // stored in the state's own format (#293 appended rotated INT8 K/V as Q4_0, into pools INT8 never has)
         if (!no_batch_kv && st_.kv_q4)
             kv_append_q4_steps(st_.k_q4, st_.v_q4, st_.page_table, step, 4, T, kcur_, vcur_, s, cs, &st_.host);
@@ -908,8 +923,11 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
                     kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
                                    vcur_ + t * NKV * HD, s, cs, &st_.host);
             }
+        fwd_mark("G kv append");
     } catch (const std::exception& e) {
         err = std::string("mtp: ") + e.what();
+        if (strata::mtp_ctx_check_on())
+            std::fprintf(stderr, "CTXCHECK fwd: FAILED after last mark; %s\n", e.what());
         return false;
     }
     return true;
