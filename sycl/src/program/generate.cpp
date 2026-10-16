@@ -3578,12 +3578,15 @@ int main(int argc, char **argv) try {
         try {
     const strata::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
-        dpct::get_current_device().get_memory_info(fb, tb);   // #423 (tmking01): dpct dropped cudaMemGetInfo here
         /*
         DPCT1106: 'cudaMemGetInfo' was migrated with the Intel extensions
         for device information which may not be supported by all compilers or
         runtimes. You may need to adjust the code.
         */
+        dpct::get_current_device().get_memory_info(fb, tb);   // #423 (tmking01): dpct dropped cudaMemGetInfo here
+        // device_free_bytes() is the same probe with the fallbacks the raw dpct shim lacks: the Linux DRM
+        // fdinfo and the explicit STRATA_VRAM_FREE_MIB figure for drivers (Windows Arc) that report nothing.
+        fb = strata::core::device_free_bytes();
 
         const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
         const int64_t base_reserve =

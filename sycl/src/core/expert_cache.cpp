@@ -87,6 +87,35 @@ size_t device_free_bytes() try {
             free_b = (size_t) (total_b - own);
         }
 #endif
+    // Windows Arc drivers (both generations here) answer no ext_intel_free_memory on an Arc A770, so the dpct
+    // probe above reports 0 free there and every size-from-free decision collapses.  This port does not guess
+    // the figure (a wrong guess is an overcommit): STRATA_VRAM_FREE_MIB states the free MiB per device index,
+    // the way the WSL experiments used STRATA_WSL_FREE_MIB.  "0,13000" leaves device 0 to its driver and sizes
+    // device 1 from 13000 MiB.  It must describe the card at the moment the figure is read, other processes
+    // included; the reserve math in the callers still carves the windows off it.
+    if (free_b == 0) {
+        static const std::vector<long long> ovr = [] {
+            std::vector<long long> v;
+            if (const char* e = std::getenv("STRATA_VRAM_FREE_MIB"))
+                for (const char* p = e; *p; ) {
+                    char* end = nullptr;
+                    const long long x = std::strtoll(p, &end, 10);
+                    v.push_back(end && end != p ? x : 0);
+                    p = end ? end : p + 1;
+                    while (*p == ',') ++p;
+                }
+            return v;
+        }();
+        int dev = -1;
+        DPCT_CHECK_ERROR(dev = dpct::get_current_device_id());
+        if (dev >= 0 && dev < (int) ovr.size() && ovr[(size_t) dev] > 0) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "strata: CUDA%d reports no free memory; sizing it from STRATA_VRAM_FREE_MIB (%lld MiB)\n",
+                             dev, ovr[(size_t) dev]);
+            free_b = std::min((size_t) ovr[(size_t) dev] << 20, total_b);
+        }
+    }
     // #1440: own_drm_local_bytes() sums every DRM fd of the process, i.e. both cards on a layer split, and would charge the
     // first card's cache to the second. With more than one GPU it runs only where the driver reports the whole card as
     // free (Arc A750/i915); a one-GPU run keeps the figure it always had.
