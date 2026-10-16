@@ -721,27 +721,41 @@ inline bool staged_gemm(sycl::queue& q, void* handle, const uint16_t* W, int lda
     const size_t es = 2;
     const size_t w_bytes = (size_t) lda * (size_t) N * es;   // W stored K x N, col-major (lda = K)
     const size_t x_bytes = (size_t) ldb * (size_t) T * es;   // X stored ldb x T
+    // The output too (2026-10-16, A770 stage of a 0-10 / 11-47 split): with the stage's 37 layers the prompt's GU
+    // buffer lay past 4 GiB, and the expert gate/up GEMM wrote non-finite rows from finite inputs; a 22 / 26 split never
+    // reached it.  Y is N x T col-major, ldy floats per column.
+    const size_t y_bytes = (size_t) ldy * (size_t) T * sizeof(float);
     const bool far_w = strata::device_offset_end(W, w_bytes) > k4G;
     const bool far_x = strata::device_offset_end(X, x_bytes) > k4G;
-    if (no_stage || (!far_w && !far_x)) return false;
-    uint8_t* s = gemm_stage(w_bytes + x_bytes, q);
+    const bool far_y = strata::device_offset_end(Y, y_bytes) > k4G;
+    if (no_stage || (!far_w && !far_x && !far_y)) return false;
+    if (static std::atomic<int> said{0}; !(said.fetch_or(1 << (far_w | far_x << 1 | far_y << 2)) & (1 << (far_w | far_x << 1 | far_y << 2))))
+        std::fprintf(stderr, "strata: staging a GEMM past 4 GiB on %s: W %s, X %s, Y %s\n",
+                     q.get_device().get_info<sycl::info::device::name>().c_str(),
+                     far_w ? "far" : "near", far_x ? "far" : "near", far_y ? "far" : "near");
+    const size_t y_off = (w_bytes + x_bytes + 255) & ~(size_t) 255;
+    uint8_t* s = gemm_stage(y_off + (far_y ? y_bytes : 0), q);
     if (s == nullptr) {
         std::fprintf(stderr, "strata: WARNING: a GEMM operand lies past 4 GiB and the %zu MiB staging buffer could not be "
                              "allocated; the GEMM runs directly and may be wrong on this card\n",
-                     (w_bytes + x_bytes) >> 20);
+                     (y_off + (far_y ? y_bytes : 0)) >> 20);
         return false;
     }
     uint8_t* sw = s;
     uint8_t* sx = s + w_bytes;
+    float* sy = (float*) (s + y_off);
     if (far_w) q.memcpy(sw, W, w_bytes);
     if (far_x) q.memcpy(sx, X, x_bytes);
+    if (far_y && beta != 0.0f) q.memcpy(sy, Y, y_bytes);   // an accumulating GEMM reads Y first
     const uint16_t* Wu = far_w ? (const uint16_t*) sw : W;
     const uint16_t* Xu = far_x ? (const uint16_t*) sx : X;
+    float* Yu = far_y ? sy : Y;
     ck(DPCT_CHECK_ERROR(dpct::blas::gemm(
            (dpct::blas::descriptor_ptr) handle, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-           (int) N, (int) T, (int) K, &alpha, Wu, dt, lda, Xu, dt, ldb, &beta, Y,
+           (int) N, (int) T, (int) K, &alpha, Wu, dt, lda, Xu, dt, ldb, &beta, Yu,
            dpct::library_data_t::real_float, (int) ldy, dpct::compute_type::f32)),
        "cublasGemmEx (staged)");
+    if (far_y) q.memcpy(Y, sy, y_bytes);   // in order on q: after the GEMM, before the next kernel reads Y
     return true;
 }
 }  // namespace
