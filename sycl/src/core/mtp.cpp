@@ -519,13 +519,21 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
     DPCT1025: The SYCL queue is created ignoring the flag and priority
     options.
     */
-    if (DPCT_CHECK_ERROR(
-            side_ = dpct::get_current_device().create_queue(true)) != 0 ||
-        DPCT_CHECK_ERROR(sh_fork_ = new sycl::event()) != 0 ||
-        DPCT_CHECK_ERROR(sh_join_ = new sycl::event()) != 0) {
-        err = "mtp: streams";
-        return false;
+    {
+        // The side branch must belong to the drafter's device, whatever OnDevice the caller had active.
+        const OnDevice on_device(device_);
+        if (DPCT_CHECK_ERROR(
+                side_ = dpct::get_current_device().create_queue(true)) != 0 ||
+            DPCT_CHECK_ERROR(sh_fork_ = new sycl::event()) != 0 ||
+            DPCT_CHECK_ERROR(sh_join_ = new sycl::event()) != 0) {
+            err = "mtp: streams";
+            return false;
+        }
     }
+    std::fprintf(stderr, "strata mtp: side branch queue: %s (cs_: %s; same context: %s)\n",
+                 side_->get_device().get_info<sycl::info::device::name>().c_str(),
+                 cs_->get_device().get_info<sycl::info::device::name>().c_str(),
+                 side_->get_context() == cs_->get_context() ? "yes" : "NO");
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     if (shared != nullptr) {
         std::fprintf(stderr, "strata mtp: shared draft weights, %.0f MiB of private state and buffers\n",
