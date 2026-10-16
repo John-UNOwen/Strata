@@ -90,3 +90,12 @@ So no run yet separates "two cards / two contexts" from "the E-4 path". E-4 has 
 | B | `start-2c-mtp-k22-check-sd0.bat` + `STRATA_MTP_BATCH=0` (E-4 on the stage-1 thread, one context) | the thread placement matters | it needs two contexts plus E-4: add the state scan (2) to the failing config |
 | C | single-card A770, `--mtp` vs no mtp, same prompt | - | whether mtp pays at all on this engine |
 | D | split11 + `--mtp` | - | the measured default has a different layout; k22 may not matter |
+
+### Runs A and B executed 16:53/17:05 (bats `start-1c-a770-mtp-check-batch0.bat`, `start-2c-mtp-k22-check-sd0-batch0.bat`; note both append to the PARENT config's log via the inherited `"log"` field)
+- A (single A770, E-4 forced): no storm, no guard hit, decode 19.9-20.7 tok/s. Drafts collapsed after warmup (accepted 1 of 1, suffix 1 of 1) - but the SAME collapse happened in the 08:42 E-9 run of this config, so it is a pre-existing serve-side draft-disabling behavior on this config, not an E-4 symptom. Verdict: E-4 alone on one context does not reproduce.
+- B (sd0, E-4 on the stage-1 thread, one context): CLEAN and healthy - drafts 146/249, 182/263, 185/281, 231/310, 235/304 (66-78%), decode 9.4-10.7 tok/s. Verdict per the table: the failure **needs two contexts plus E-4**.
+- Caveat: neither batch0 config carried `STRATA_DBG_NAN` (inherited env), so NaN detection there relied only on the serve #606 repeat guard and draft health. Re-running A/B with `STRATA_DBG_NAN=1` would be stricter. UPDATE: both batch0 configs now carry `STRATA_DBG_NAN=1` (17:15), so strict re-runs are ready.
+
+### Benchmark pollution ledger (the `!!!!!` bug taints speed numbers)
+INVALID (storm-contaminated, decode was garbage-token spam): k22 mtp 29.7 tok/s (09:10 graph run, window NaN at 7578 mid-request), 19.3/22.4 tok/s (09:03 eager run), and every k22 mtp run after a window NaN (1047/1325/7578/7630 family).
+CLEAN baselines for the mtp-value question: nomtp B580-alone ~10.4 tok/s decode (KB control); mtp sd0 9.4-10.7 (17:05, drafts 66-78%); a770-alone nomtp 14.0/20.7 (KB control C); nomtp k22 64k daily (`strata-iq2_xs-2card-k22-ctx64k.log`): decode 18.0-24.4 tok/s with spec-4 suffix drafts already accepting 86% (276/321, 104/122). mtp has never beaten a clean nomtp baseline on any config that works; the only apparent gain (29.7 on k22) came from the broken one. To justify finishing cross-card mtp, a FIXED k22 mtp must beat 18-24 tok/s clean, ideally while raising the 86% suffix-draft acceptance the nomtp spec-4 path already gets.
