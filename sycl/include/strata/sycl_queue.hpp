@@ -158,6 +158,23 @@ inline IntelGpuGen intel_gpu_gen(const sycl::device& d) {
 }
 }  // namespace strata
 
+#include <mutex>
+#include <unordered_map>
+namespace strata {
+// intel_gpu_gen() once per DEVICE.  A per-generation choice kept in a function's `static` is made by whichever card
+// asks first and then applies to every card: harmless on one card or two of one generation, wrong on a layer split
+// across generations (B580 + A770, 2026-10-16).  Per-generation choices ask this with the queue's own device.
+inline IntelGpuGen intel_gpu_gen_of(const sycl::device& d) {
+    static std::mutex mu;
+    static std::unordered_map<sycl::device, IntelGpuGen> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    if (const auto it = cache.find(d); it != cache.end()) return it->second;
+    const IntelGpuGen g = intel_gpu_gen(d);
+    cache.emplace(d, g);
+    return g;
+}
+}  // namespace strata
+
 #include <cstdint>
 namespace strata {
 // Does every page of a big device allocation keep its own bytes?  On an Arc Pro B70 (xe) a 22 GiB expert-cache arena came

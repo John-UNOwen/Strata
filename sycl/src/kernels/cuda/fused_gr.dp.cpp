@@ -626,13 +626,10 @@ __dpct_inline__ void gr_down_reduce_kernel(GrMulti m) {
 // On the A770 the up kernel spills ~3.4 KB per thread at 128 (unitrace). Large GRF halves the threads an Xe core keeps
 // resident, so it is the default on Arc A-series (Alchemist) only, where it was measured; Battlemage and anything else
 // keep the compiler's default GRF and the same kernels as before. STRATA_GR_LARGE_GRF=1 forces it on, =0 off.
-bool gr_large_grf(sycl::queue* q) {
-    static const bool v = [q] {
-        const char* e = std::getenv("STRATA_GR_LARGE_GRF");
-        if (e != nullptr) return std::atoi(e) != 0;
-        return strata::intel_gpu_gen(q->get_device()) == strata::IntelGpuGen::Alchemist;
-    }();
-    return v;
+bool gr_large_grf(sycl::queue* q) {   // (the default per device: intel_gpu_gen_of)
+    static const int env = [] { const char* e = std::getenv("STRATA_GR_LARGE_GRF"); return e ? (std::atoi(e) != 0) : -1; }();
+    if (env >= 0) return env != 0;
+    return strata::intel_gpu_gen_of(q->get_device()) == strata::IntelGpuGen::Alchemist;
 }
 // More, smaller work-groups for the multi-token read on Arc A-series: the sliced down kernel as (slice, row block)
 // = 480 groups instead of 80, its reduce with 8 loads in flight, and the up kernel with 8 columns per group (320
@@ -640,13 +637,10 @@ bool gr_large_grf(sycl::queue* q) {
 // output is the same float sum in the same order (gr_bench checksums unchanged). A770, gr_bench 1-6 tokens:
 // 117-180 -> 87-149 us; decode 28.04-28.54 -> 29.99-30.00 tok/s. Default on Alchemist only, where it was measured;
 // elsewhere the 80 / 160-group kernels as before. STRATA_GR_MORE_GROUPS=1 forces it on, =0 off.
-bool gr_more_groups(sycl::queue* q) {
-    static const bool v = [q] {
-        const char* e = std::getenv("STRATA_GR_MORE_GROUPS");
-        if (e != nullptr) return std::atoi(e) != 0;
-        return strata::intel_gpu_gen(q->get_device()) == strata::IntelGpuGen::Alchemist;
-    }();
-    return v;
+bool gr_more_groups(sycl::queue* q) {   // (the default per device: intel_gpu_gen_of)
+    static const int env = [] { const char* e = std::getenv("STRATA_GR_MORE_GROUPS"); return e ? (std::atoi(e) != 0) : -1; }();
+    if (env >= 0) return env != 0;
+    return strata::intel_gpu_gen_of(q->get_device()) == strata::IntelGpuGen::Alchemist;
 }
 bool gr_down_sliced() {   // default (gr_bench: GR read 108.6 -> 76.5 us at 6 tokens); STRATA_GR_DOWN_SLICED=0: direct
     static const bool v = std::getenv("STRATA_GR_DOWN_SLICED") == nullptr || std::atoi(std::getenv("STRATA_GR_DOWN_SLICED")) != 0;

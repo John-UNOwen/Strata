@@ -278,3 +278,46 @@ Dump analysis (no debugger on this PC; parser written at `C:\strata-deps\mdstack
 Net: **the v2 adapter is not the culprit**. Cross-device signaling between the two Arcs deadlocks under either adapter generation, at whichever point the engine first does a device-0 -> device-1 event wait (verify window 2 with v2, prefill chunk with v1). Prime suspect now: the hand-off event/wait objects themselves across two Level Zero adapters on Windows (same-driver two-card setup), including the pinned host chunk buffers and the `ze_event_pool` usage per stage; the passing single-card runs never create a cross-device wait.
 
 **Reproduction confirmed (23:45 second run, same config): byte-identical failure.** Same stall stage (`finishing the chunk from token 2048`), same idle counts (host idle, all workers parked), new dump `strata-stall-19756.dmp` with the same thread fingerprint as run 1: host thread parked at `ntdll+0xa4a04` over the identical v1-adapter frame sequence (`ur_adapter_level_zero.dll+0x160710/+0x199610/+0x5e89c/+0x36da3` under `sycl9.dll+0x1b483e/+0x2c3cc9/+0x1be133` via `ur_loader.dll`), 11 workers in the same CRT wait. No TDR events for either stall - this is a pure deadlock, not a GPU hang. The `0xc0000409` application-error events at both run ends are the watchdog's own fast-fail exit after writing the dump (`ucrtbase.dll+0x7f6fe`), not an independent fault. The point of failure is deterministic at the first prefill hand-off crossing (chunk 2048 = first chunk that crosses to CUDA1); run 2 also mapped more host memory before stalling (6255 vs 1678 MiB resident, 3.98M vs 1.41M page faults) without changing the outcome.
+
+## 15. Review of sections 12-14 (2026-10-16): per-card choices made once per process
+
+**Section 12's graph theory is withdrawn.** The probes and Controls B/C rule it out. The differential in section 13 is the useful result: the same machinery passes on either card alone and fails only with both cards.
+
+**What every earlier two-card test had in common: identical cards** (2x B60, 2x B70). This pair mixes generations: a Battlemage B580 and an Alchemist A770. The SYCL port has several workarounds per generation, and some are decided in a function-level `static` with the device of whichever card asks first. In a split that is the B580 (stage 0), and its choice then applies to the A770 too:
+
+| Where | Choice | What the A770 got in the split |
+|---|---|---|
+| `prefill/gemm.dp.cpp` `no_stage` | stage GEMM operands past 4 GiB (the A770 oneMKL bug, docs/INTEL.md: non-finite prompts, "routed id out of range", segfaults) | **no staging** |
+| `core/verify.cpp` `wmode` | drain before every window (#2194, the A770 window that never starts) | **no drain**, unless `STRATA_WINDOW_SYNC=1` was set (it was in the 22:37 run only) |
+| `kernels/cuda/fused_gr.dp.cpp` `gr_large_grf`, `gr_more_groups` | large GRF / more work-groups | Battlemage defaults (speed only) |
+| `prefill/kernels.dp.cpp` `gdn_xe_on` | the GDN Xe variant | Battlemage default (speed only, same bits) |
+
+Checked and fine:
+- `spin_max` and the copy engine are per device.
+- `doorbell_plain_payload` reads sysfs, which gives the same answer for both cards on Windows.
+- The `generate.cpp:2256` borrow rule applies only to single-card runs.
+- dpct's current device is per thread.
+- The hand-off buffers are host USM, with no P2P.
+
+**Fixed in this commit:** `strata::intel_gpu_gen_of(device)` (sycl_queue.hpp) caches the generation per device, and the four places above ask it with their own queue's device. The `STRATA_*` env overrides still apply to every card. Runs on one card, or on two cards of one generation, make exactly the choices they made before. Not built here (no oneAPI in this container).
+
+Whether this is *the* fault is not known.
+- The GEMM staging matters only where an operand lies past 4 GiB into its allocation. In a split the prompt path keeps its own buffers (`max_context <= 32768`), so it depends on where the dense weights and the cache slots sit on the A770 (6.9 GiB cache).
+- If the A770 stage computes garbage, the hangs follow from it: garbage routing makes doorbell plans the CPU pool cannot serve. That is the documented failure family of the 4 GiB bug.
+
+**Two confounds to keep in mind when comparing runs:**
+1. **Prompt length chooses the cross-card mechanism.**
+   - A prompt of one chunk (≤ 2048 tokens here, e.g. the 1,960-token runs) runs the stages one after the other. The A770 helps the B580's stage as a stream-only peer, with queue barriers on events of the other card (`prefill.cpp` `bind_stage_helper`; the helper share is `STRATA_PREFILL_HELP_FRAC`).
+   - A longer prompt (Control B) runs stage 1 on a `std::async` thread **concurrently** with stage 0's next chunk (`prefill.cpp:4457`). That is the path that stalled.
+
+   So the v2 runs and the v1 run (Control B) did not differ only in the adapter. The v1 result does not clear or convict v2.
+2. **`std::async` on MSVC runs on a reused thread pool.** On Linux, libstdc++ starts a new thread each time. `thread_local` state (dpct's device stack, `gemm_stage`'s scratch) persists across tasks on Windows. No harm found, but it is a Windows-only difference on exactly the stalled path.
+
+**Runs, in order (user-launched; `start-2c-nomtp.bat` base, graphs on, no `STRATA_VERIFY_EAGER`, no `SYCL_UR_USE_LEVEL_ZERO_V2` override):**
+1. **Rebuilt engine, same ~3.3K-token prompt as Control B.** If it decodes several windows, the per-card choices were the fault; then add `--mtp` back.
+2. **If 1 stalls:** add `--prefill 4096` and `STRATA_PREFILL_HELP_FRAC=0`. The prompt is then one chunk, stage 1 runs after stage 0, and no queue waits on the other card's events.
+   - It passes: the concurrent stage thread or the cross-card waits are the fault.
+   - It stalls the same way: the fault is in the A770 stage's own work while both cards are initialized.
+3. **For any stall dump:** say which thread holds the SYCL frames. The main thread waiting on `next_run_` would sit in an ordinary wait, and the stage-1 task thread would sit in the SYCL wait. That tells whether the B580 hand-off memcpy or the A770 stage is stuck.
+
+Latent, not on the engine's paths as far as traced: `kernels/cuda/qsa.dp.cpp` `step_scratch()` is one device buffer per process, allocated on the first caller's card. It serves the legacy direct-launch `kv_append` / `qsa_index` / `topk_512`, not the captured ones.

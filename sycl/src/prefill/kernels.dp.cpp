@@ -2612,14 +2612,18 @@ static bool gdn_xe_device(void* stream) {
     const bool sg16 = std::find(subgroups.begin(), subgroups.end(), size_t(16)) != subgroups.end();
     return sg16 && device.is_gpu() && device.get_info<sycl::info::device::vendor_id>() == 0x8086;
 }
-static bool gdn_xe_on(void* stream) {
-    static const bool on = [stream] {
-        const char* v = std::getenv("STRATA_GDN_XE");
-        if (v && *v) return std::atoi(v) != 0 && gdn_xe_device(stream);
-        return strata::intel_gpu_gen(strata::q_of(stream)->get_device()) == strata::IntelGpuGen::Alchemist &&
-               gdn_xe_device(stream);
-    }();
-    return on;
+static bool gdn_xe_on(void* stream) {   // per device: a split across generations runs variant 6 on its Alchemist card only
+    static const int env = [] { const char* v = std::getenv("STRATA_GDN_XE"); return v && *v ? (std::atoi(v) != 0) : -1; }();
+    if (env == 0) return false;
+    const sycl::device d = strata::q_of(stream)->get_device();
+    if (env < 0 && strata::intel_gpu_gen_of(d) != strata::IntelGpuGen::Alchemist) return false;
+    static std::mutex mu;
+    static std::unordered_map<sycl::device, bool> sg16;
+    std::lock_guard<std::mutex> lk(mu);
+    if (const auto it = sg16.find(d); it != sg16.end()) return it->second;
+    const bool ok = gdn_xe_device(stream);
+    sg16.emplace(d, ok);
+    return ok;
 }
 void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,

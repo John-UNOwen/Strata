@@ -2034,9 +2034,10 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         // STRATA_WINDOW_SYNC=0 (stepped, --resident-experts, IQ3_XXS): 1 of 6 runs hung there (same stack), against 0 of 11
         // with the drain. So the default drain is per GPU generation now: every Alchemist card (i915 or xe), as before
         // every i915 card; Battlemage and the others are unchanged (0).
+        // (per stage's device: on a split across generations the Alchemist stage drains and the Battlemage one does not)
         static const char* wv = std::getenv("STRATA_WINDOW_SYNC");
-        static const int wmode = wv ? std::atoi(wv)
-                                    : ((intel_i915_gpu() || strata::intel_gpu_gen(cs_->get_device()) == strata::IntelGpuGen::Alchemist) ? 1 : 0);
+        const int wmode = wv ? std::atoi(wv)
+                             : ((intel_i915_gpu() || strata::intel_gpu_gen_of(cs_->get_device()) == strata::IntelGpuGen::Alchemist) ? 1 : 0);
         const bool first_or_gap = t_prev_end.time_since_epoch().count() == 0 || (t_launch - t_prev_end) > std::chrono::milliseconds(20);
         if (wmode == 1 || (wmode == 2 && first_or_gap)) dpct::get_current_device().queues_wait_and_throw();
     }
