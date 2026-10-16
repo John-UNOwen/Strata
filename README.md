@@ -48,6 +48,14 @@ NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K pro
 about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
 [community results](docs/COMMUNITY_BENCHMARKS.md).
 
+Intel Arc on Windows (built from source, engine 0.1.44.1, IQ2_XS, measured 2026-10):
+
+| Intel setup | Writes answers | Reads your prompt |
+| --- | ---: | ---: |
+| Arc B580 (12 GB) alone | 10 tokens/s | ~100 tokens/s |
+| Arc A770 (16 GB) alone | 14-21 tokens/s | 90-130 tokens/s |
+| Arc B580 + Arc A770 (two cards, layers split) | 35 tokens/s | 620-850 tokens/s |
+
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
 
@@ -60,12 +68,20 @@ about 100-140 tokens per second. Long chats and other cards: [speed of each mode
 | **Disk** | About 80 GB free. Use an SSD if you can: the first start is much faster. |
 | **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD. |
 
-The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
+The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)). On
+Windows, two Intel Arc cards (for example a B580 and an A770) can split the model too, from a source build (see
+[Intel Arc on Windows](docs/INTEL_WINDOWS.md) below).
 
 Experimental, written and tested by community members on their own machines:
 
 - **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
 - **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
+- **Intel Arc on Windows** (Arc A770 / A750 and Arc B580, one engine build per card generation): built from source
+  with Intel oneAPI 2026.1, not part of the installer. One card works; two Arc cards (mixing A-series and B-series is
+  fine) split the model's layers between them and are the fastest Intel setup, measured above. Start here:
+  [Intel Arc on Windows](docs/INTEL_WINDOWS.md) (keep 1-2 GB of VRAM free per card; the JIT kernel build is required
+  on Arc; the extra guess-and-check helper model is parked for two-card runs, so Intel two-card setups use the
+  built-in drafts instead).
 - **Apple Silicon Macs (M1 to M5)**, built from source by `./setup.sh` (the Metal engine): [Mac](docs/MAC.md).
 - **AMD Ryzen AI Max (Strix Halo)**, built from source on Linux: [Strix Halo](docs/STRIX_HALO.md).
 - **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
