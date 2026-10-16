@@ -74,7 +74,7 @@ So no run yet separates "two cards / two contexts" from "the E-4 path". E-4 has 
 - **The drafter's PLE session:** it is CUDA0's (`set_ple_session(&ss)`, `generate.cpp:4151`), but the drafter only calls `prefetch_rows` on it, a host-side page-cache prefetch.
 
 ### 4. Wasted VRAM, unrelated to the NaN
-- The expert-cache sizing holds back `mtp_bind` on CUDA0 (`generate.cpp:4468`), but on a split the drafter and its draft head live on the last stage.
+- The expert-cache sizing holds back `mtp_bind` on CUDA0 (`generate.cpp:4466`), but on a split the drafter and its draft head live on the last stage.
 - That is the "+143 MiB for the draft head" that reshapes the B580 cache in the DBGALLOC maps. It wastes ~143 MiB of B580 cache; it cannot cause the NaN.
 - **Fix:** reserve it on the last stage only when `multi_gpu`.
 
