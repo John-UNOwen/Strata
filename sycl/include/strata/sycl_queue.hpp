@@ -372,6 +372,14 @@ inline void device_alloc_unregister(const void* p) {
     std::lock_guard<std::mutex> lk(device_alloc_mutex());
     device_alloc_map().erase(p);
 }
+// STRATA_DBG_ALLOC=1: print every tracked allocation (base, size) sorted by address.  Tells whether anything on a
+// card crosses 4 GiB and whether a suspect buffer is tracked at all.
+inline void dbg_dump_alloc_map(const char* what) {
+    std::lock_guard<std::mutex> lk(device_alloc_mutex());
+    std::fprintf(stderr, "DBGALLOC %s: %zu tracked allocations\n", what, device_alloc_map().size());
+    for (auto& kv : device_alloc_map())
+        std::fprintf(stderr, "DBGALLOC   %p +%.2f MiB\n", (void*)kv.first, (double)kv.second / 1048576.0);
+}
 // How far into its device allocation the byte range [p, p + bytes) ends; 0 when p is not in one we know.  oneMKL's GEMM
 // reads the last, partial tile of an operand from the wrong place when it lies more than 4 GiB in (Arc A770, oneMKL
 // 2026.1), so the GEMM stages any operand this reports > 4 GiB for.  An operand in an allocation we did not register

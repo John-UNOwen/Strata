@@ -4554,6 +4554,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         std::fprintf(stderr, "; GDN state 0");
         bad(ss.gdn_state, 64 * 1024);
         std::fprintf(stderr, "\n");
+        if (std::getenv("STRATA_DBG_ALLOC") != nullptr) strata::dbg_dump_alloc_map("prompt end");
     }
     if (DPCT_CHECK_ERROR(m.cs->wait()) != 0) {
         /*
