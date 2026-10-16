@@ -28,6 +28,7 @@ Probe fields decode (`prefill.cpp:4258-4289`): counts of non-finite floats in th
 
 ## Repro and instruments
 - Fails: `start-2c-mtp-k22-check-graph.bat` (and the eager variant `start-2c-mtp-k22-check.bat` storms too). Warmup dies inside ~60 s; nothing to wait for.
-- Clean controls: `start-2c-k22-check-graph-nomtp.bat` (32k no-mtp), `start-2c-k22-ctrl64k.bat` (64k no-mtp), `start-2c-mtp-k22-check-sd0.bat` (mtp, single device).
+- Clean controls: `start-2c-k22-check-graph-nomtp.bat` (32k no-mtp), `start-2c-mtp-k22-check-sd0.bat` (mtp, single device), `start-1c-a770-mtp-check.bat` (single card, eager). The 64k controls (start-2c-k22-ctrl64k*.bat + configs/logs) and all older experiment files live in `run-archive\` (git-excluded) since 16:40.
+- New instrument 16:35 (commit 120a404): `STRATA_DBG_ALLOC=1` prints a `DBGALLOC` dump of every tracked device allocation (base + size) at prompt end; both 32k check configs have it on. Compare the maps in the clean vs NaN logs to see what crosses 4 GiB and what mtp adds untracked.
 - `STRATA_DBG_NAN=1` window/GU probes; `STRATA_MTP_CHECK_CTX=1` CTXCHECK lines (embed table, R_rows, window_R, forward phases A..G); probe matrix `C:\strata-deps\cross_usm_probe.exe` (modes `shared copy perdevice dev dev9b dev10`).
 - Always re-run gates N>=3 times: a single clean run on this split proves nothing (proven).
