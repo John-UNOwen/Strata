@@ -14,7 +14,7 @@ using namespace sycl;
 
 static void step(const std::string& msg) { std::printf("%s\n", msg.c_str()); std::fflush(stdout); }
 
-int main(int argc, char** argv) {
+static int probe_main(int argc, char** argv) {
     const int pos = argc > 1 ? std::atoi(argv[1]) : 0;
     const int replays = argc > 2 ? std::atoi(argv[2]) : 100;
     const int nodes = 2400; // the engine's window graph size
@@ -79,4 +79,18 @@ int main(int argc, char** argv) {
     }
     step("done: all replays finished with the sentinel correct");
     return 0;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return probe_main(argc, argv);
+    } catch (const sycl::exception &e) {
+        std::printf("sycl exception: %s\n", e.what());
+        std::fflush(stdout);
+        return 5;
+    } catch (const std::exception &e) {
+        std::printf("std exception: %s\n", e.what());
+        std::fflush(stdout);
+        return 6;
+    }
 }
