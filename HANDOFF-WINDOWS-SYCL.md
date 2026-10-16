@@ -196,3 +196,37 @@ Current picture for whoever picks this up. Hard facts: kernels and the CUDA1 sta
   - Equal VendorId/DeviceId/memory size was not used: two identical physical cards have those equal too, but their usage differs once the engine uses both.
   - Not measured: whether the two A770 adapters also agree on the non-local (shared) segment. If not, `sliced_pin_limit` falls back to RAM/2 - 8 GiB as before. The pinned device there is CUDA0 (the B580) anyway.
 - **First-run check (unchanged):** the "STRATA_VRAM_FREE_MIB 13000 MiB less this process's X GiB" lines, X growing to ~the cache size (section 9).
+
+## 12. Review of the two-card hangs (2026-10-16): graph work on the A770
+
+**One pattern fits all four failures (a reading of the code, not yet tested).** Every death follows a SYCL graph run on CUDA1 (the A770). The B580 runs the same graphs fine on its own.
+
+| Run | Last graph work on the A770 before the failure |
+|---|---|
+| `--mtp` (2 runs) | MTP prefill: one graph per group (mtp.cpp:1346-1363). The draft layer sits on the last stage. |
+| no MTP, graphs | the first decode window's graph. It times out at layer 18, the first A770 layer. |
+| no MTP, `STRATA_VERIFY_EAGER=1` (2 runs) | window 1 runs eagerly and completes (111-114 ms). Then **`commit()` still launches the commit graph** (verify.cpp:2631): `STRATA_VERIFY_EAGER` covers only the window (`capture` returns early, `capture_commit` does not). Window 2 dies at its first submission or drain with 39/40. |
+
+So "window 1 clean, window 2 dies" in eager mode fits a graph hang between the windows. Errors 39 and 40 and the event-pool growth would then be what a stuck queue looks like from the next submission. The A770's kernels themselves are fine: eager window 1 ran them, doorbells included.
+
+Checked and ruled out:
+- The window drain is per card. `run()` switches to its stage's device (`OnDevice`), the A770 stage defaults to the drain (Alchemist), and the B580 stage's work is done before the A770 stage starts (`next_->run` after the stage's sync).
+- `STRATA_VERIFY_STEPPED` is not involved: it is opt-in and off.
+
+**Prime suspect: the Level Zero v2 adapter on the A770's old driver.**
+- The trace says "Skipping L0 V1 adapter", so this process runs the v2 adapter, for both cards.
+- The A770 is on driver 1.6.34728 (the older runtime); the B580 is on 1.17.
+- `docs/INTEL.md` already records a v2-only hang on Alchemist: the prompt stager deadlocked under v2 and ran under `SYCL_UR_USE_LEVEL_ZERO_V2=0`.
+- SYCL graphs run through command buffers, the newest part of the adapter.
+- One cost of v1: the B580's copy-engine queue is off under v1 (copy_queue.cpp:96). The legacy adapter puts memcpy on the copy engine itself.
+
+**Next, cheapest first (each user-launched; each kernel runs for microseconds; a stuck step means a TDR reset after ~10 s, which the card recovered from every time so far):**
+1. `sycl/tools/graph_probe.cpp`: eager kernels, then the same as a graph, replayed. Build it with the icx line of the other probes, then run:
+   - a. `ONEAPI_DEVICE_SELECTOR=level_zero:1` → `graph_probe 0`
+   - b. `ONEAPI_DEVICE_SELECTOR=level_zero:0;level_zero:1` → `graph_probe 1` (both cards in one context, as the engine has)
+   - c. b with `SYCL_UR_USE_LEVEL_ZERO_V2=0`
+   - d. b on the B580: `graph_probe 0`, as a control
+
+   If b hangs and c passes, it is the v2 adapter.
+2. If the probe confirms it: the engine run `start-2c-nomtp.bat` with `SYCL_UR_USE_LEVEL_ZERO_V2=0` and **without** `STRATA_VERIFY_EAGER` (graphs on). If that decodes several windows, add `--mtp` back.
+3. If every probe passes: the trouble is graph *content*, not graphs as such. Run `start-2c-b580.bat` next (section 10), and consider an eager commit (`record_commit` out of `capture_commit`, run directly under `STRATA_VERIFY_EAGER`). Then a fully graph-free A770 stage is possible as a test, except for MTP.
