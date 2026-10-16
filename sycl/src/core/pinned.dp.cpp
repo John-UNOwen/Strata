@@ -4,6 +4,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/core/win_dxgi.hpp"
 
 #include <atomic>
 #include <climits>
@@ -25,7 +26,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#include <dxgi1_2.h>
+#include <dxgi1_4.h>   // IDXGIAdapter3::QueryVideoMemoryInfo (win_dxgi.hpp)
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -311,13 +312,12 @@ int arena_pin_cap_gib() {
     return v < 0 ? -1 : v;
 }
 
-namespace {
 #ifdef _WIN32
-// The pinned device's LUID, which gpu_shared_memory_budget needs: Level Zero exposes no LUID, so the
-// SYCL device name is matched against the DXGI adapter descriptions (the Intel driver reports both
-// verbatim, e.g. "Intel(R) Arc(TM) B580 Graphics").
-bool current_device_luid(LUID& out) {
-    const std::string name = dpct::get_in_order_queue().get_device().get_info<sycl::info::device::name>();
+namespace {
+// Calls f(adapter) for the one DXGI adapter whose description is `name` (win_dxgi.hpp); false when none or several
+// have it, or DXGI is not there.
+template <class F>
+bool with_adapter_named(const std::string& name, F&& f) {
     const int wlen = MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, nullptr, 0);
     if (wlen <= 1 || wlen > 255) return false;
     wchar_t wname[256] = {};
@@ -327,19 +327,49 @@ bool current_device_luid(LUID& out) {
     using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
     const auto create = (CreateFactory) (void*) GetProcAddress(dxgi, "CreateDXGIFactory1");
     IDXGIFactory1* factory = nullptr;
-    bool ok = false;
+    IDXGIAdapter1* match = nullptr;
+    int matches = 0;
     if (create != nullptr && SUCCEEDED(create(__uuidof(IDXGIFactory1), (void**) &factory)) && factory != nullptr) {
-        for (UINT i = 0; !ok; ++i) {
+        for (UINT i = 0;; ++i) {
             IDXGIAdapter1* a = nullptr;
             if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND || a == nullptr) break;
             DXGI_ADAPTER_DESC1 d{};
-            if (SUCCEEDED(a->GetDesc1(&d)) && lstrcmpW(d.Description, wname) == 0) { out = d.AdapterLuid; ok = true; }
+            if (SUCCEEDED(a->GetDesc1(&d)) && lstrcmpW(d.Description, wname) == 0 && ++matches == 1) { match = a; continue; }
             a->Release();
         }
         factory->Release();
     }
+    const bool ok = matches == 1 && f(match);
+    if (match != nullptr) match->Release();
     FreeLibrary(dxgi);
     return ok;
+}
+}  // namespace
+
+bool dxgi_local_memory(const std::string& device_name, uint64_t& budget, uint64_t& usage) {
+    return with_adapter_named(device_name, [&](IDXGIAdapter1* a) {
+        IDXGIAdapter3* a3 = nullptr;
+        if (FAILED(a->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &a3)) || a3 == nullptr) return false;
+        DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+        const bool ok = SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info));
+        a3->Release();
+        if (ok) { budget = info.Budget; usage = info.CurrentUsage; }
+        return ok;
+    });
+}
+#endif
+
+namespace {
+#ifdef _WIN32
+// The pinned device's LUID, which gpu_shared_memory_budget needs (see with_adapter_named).
+bool current_device_luid(LUID& out) {
+    const std::string name = dpct::get_in_order_queue().get_device().get_info<sycl::info::device::name>();
+    return with_adapter_named(name, [&](IDXGIAdapter1* a) {
+        DXGI_ADAPTER_DESC1 d{};
+        if (FAILED(a->GetDesc1(&d))) return false;
+        out = d.AdapterLuid;
+        return true;
+    });
 }
 // #243: how much of the arena the sliced registration may pin on Windows when the whole arena was refused.
 // Page-locked memory the GPU maps is charged to its shared (non-local) WDDM segment; pinned slice by slice until

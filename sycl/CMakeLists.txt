@@ -90,11 +90,8 @@ if(WIN32 AND STRATA_SYCL_AOT)
   list(APPEND _sycl_link -fsycl-device-code-split=off)
   list(APPEND _sycl_flags -fsycl-device-code-split=off)
 else()
-  # The JIT link also runs sycl-post-link on Windows, and per-kernel modules link fine here (build + two-card
-  # start verified 2026-10-16). Whole-TU modules are the problem: the card's JIT then compiles every kernel of
-  # the module, including the shapes that card cannot build - an Arc A770 died at start with "Unsupported
-  # JointMatrix operation ... SG16 ... supported values: 16" on Battlemage kernels it never launches.
-  # Per-kernel modules let each card JIT only what it runs, which is how the Alchemist JIT builds work on Linux.
+  # (the Windows JIT link runs sycl-post-link too, and per-kernel modules link fine there: build and two-card
+  # start verified 2026-10-16)
   list(APPEND _sycl_link -fsycl-device-code-split=per_kernel)
   list(APPEND _sycl_flags -fsycl-device-code-split=per_kernel)
 endif()

@@ -3584,9 +3584,10 @@ int main(int argc, char **argv) try {
         runtimes. You may need to adjust the code.
         */
         dpct::get_current_device().get_memory_info(fb, tb);   // #423 (tmking01): dpct dropped cudaMemGetInfo here
-        // device_free_bytes() is the same probe with the fallbacks the raw dpct shim lacks: the Linux DRM
-        // fdinfo and the explicit STRATA_VRAM_FREE_MIB figure for drivers (Windows Arc) that report nothing.
-        fb = strata::core::device_free_bytes();
+        // A driver that reports no free memory (Windows Arc A770; xe without ext_intel_free_memory) gets
+        // device_free_bytes()'s fallbacks: the Linux DRM fdinfo, or STRATA_VRAM_FREE_MIB less this process's use (DXGI)
+        // on Windows.  A reported figure is used as before.
+        if (fb == 0) fb = strata::core::device_free_bytes();
 
         const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
         const int64_t base_reserve =

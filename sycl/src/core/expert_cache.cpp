@@ -6,6 +6,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/win_dxgi.hpp"
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
@@ -24,6 +25,8 @@
 #include <cstdlib>
 #include <utility>
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace strata::core {
 
@@ -63,6 +66,73 @@ static unsigned long long own_drm_local_bytes() {
 #endif
 }
 
+#if defined(_WIN32)
+// STRATA_VRAM_FREE_MIB="0,13000": the free MiB of each card whose driver reports none, by device index - the
+// index after ONEAPI_DEVICE_SELECTOR, the N of "CUDAN" in the log.  0 or an empty entry leaves that card to its
+// driver.  Anything but numbers, spaces and commas disables the whole variable (said once): a half-read list
+// would size a card from the wrong figure.
+static const std::vector<long long>& stated_free_mib() {
+    static const std::vector<long long> v = [] {
+        std::vector<long long> out;
+        const char* e = std::getenv("STRATA_VRAM_FREE_MIB");
+        if (e == nullptr) return out;
+        const char* p = e;
+        bool ok = true;
+        for (;;) {   // each pass consumes one entry and its comma, or stops
+            while (*p == ' ') ++p;
+            long long x = 0;
+            if (*p >= '0' && *p <= '9') { char* end = nullptr; x = std::strtoll(p, &end, 10); p = end; }
+            while (*p == ' ') ++p;
+            out.push_back(x);
+            if (*p == ',') { ++p; continue; }
+            ok = *p == '\0';
+            break;
+        }
+        if (!ok) {
+            std::fprintf(stderr, "strata: STRATA_VRAM_FREE_MIB=\"%s\" is not a comma-separated list of MiB (e.g. \"0,13000\"); ignored\n", e);
+            out.clear();
+        }
+        return out;
+    }();
+    return v;
+}
+
+// The free bytes of the current card when its driver reports none (the Windows Arc A770 answers no
+// ext_intel_free_memory; the B580 in the same PC does).  The port does not guess the figure, since a wrong guess is
+// an overcommit: STRATA_VRAM_FREE_MIB states what was free before the engine started, and DXGI says how much of the
+// card this process holds now, which is taken off it - so the figure shrinks as the caches fill, and the checks made
+// after an allocation still see it.  Capped by the OS's budget for the process (other programs included).  Without
+// DXGI's numbers the stated figure would never shrink, so it is not used.  0: nothing stated or nothing known.
+static size_t stated_free_bytes(size_t total_b) {
+    const auto& mib = stated_free_mib();
+    int dev = -1;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 || dev >= (int) mib.size() ||
+        mib[(size_t) dev] <= 0)
+        return 0;
+    static std::atomic<unsigned> said{0};   // the refusal: one line per card
+    const bool say = dev < 32 && !(said.fetch_or(1u << dev) & (1u << dev));
+    const std::string name = dpct::get_current_device().get_info<sycl::info::device::name>();
+    uint64_t budget = 0, usage = 0;
+    if (!dxgi_local_memory(name, budget, usage)) {
+        if (say)
+            std::fprintf(stderr, "strata: CUDA%d reports no free memory, and DXGI has no single adapter named \"%s\" to "
+                                 "count this process's use of it; STRATA_VRAM_FREE_MIB is not used for it\n", dev, name.c_str());
+        return 0;
+    }
+    const uint64_t stated = std::min<uint64_t>((uint64_t) mib[(size_t) dev] << 20, total_b);
+    const uint64_t left = stated > usage ? stated - usage : 0;
+    const uint64_t room = budget > usage ? budget - usage : 0;
+    const uint64_t free_b = std::min(left, room);
+    // every read is logged (a handful per start): the usage column growing as the caches fill is the evidence that
+    // DXGI counts the Level Zero allocations at all
+    std::fprintf(stderr, "strata: CUDA%d reports no free memory; STRATA_VRAM_FREE_MIB %lld MiB less this process's "
+                         "%.2f GiB on it (DXGI), within the OS budget of %.2f GiB: %.2f GiB free\n",
+                 dev, mib[(size_t) dev], (double) usage / 1073741824.0, (double) budget / 1073741824.0,
+                 (double) free_b / 1073741824.0);
+    return (size_t) free_b;
+}
+#endif
+
 // See the header.  NVIDIA's DGX Spark Porting Guide (section 5.5, "Memory reporting on UMA systems") recommends the same:
 // not to rely on cudaMemGetInfo alone but to count the memory the OS can reclaim.  Swap is not counted here (unlike
 // NVIDIA's reference snippet): an expert cache that pushes the system into swap would be far slower than a smaller one.
@@ -87,35 +157,9 @@ size_t device_free_bytes() try {
             free_b = (size_t) (total_b - own);
         }
 #endif
-    // Windows Arc drivers (both generations here) answer no ext_intel_free_memory on an Arc A770, so the dpct
-    // probe above reports 0 free there and every size-from-free decision collapses.  This port does not guess
-    // the figure (a wrong guess is an overcommit): STRATA_VRAM_FREE_MIB states the free MiB per device index,
-    // the way the WSL experiments used STRATA_WSL_FREE_MIB.  "0,13000" leaves device 0 to its driver and sizes
-    // device 1 from 13000 MiB.  It must describe the card at the moment the figure is read, other processes
-    // included; the reserve math in the callers still carves the windows off it.
-    if (free_b == 0) {
-        static const std::vector<long long> ovr = [] {
-            std::vector<long long> v;
-            if (const char* e = std::getenv("STRATA_VRAM_FREE_MIB"))
-                for (const char* p = e; *p; ) {
-                    char* end = nullptr;
-                    const long long x = std::strtoll(p, &end, 10);
-                    v.push_back(end && end != p ? x : 0);
-                    p = end ? end : p + 1;
-                    while (*p == ',') ++p;
-                }
-            return v;
-        }();
-        int dev = -1;
-        DPCT_CHECK_ERROR(dev = dpct::get_current_device_id());
-        if (dev >= 0 && dev < (int) ovr.size() && ovr[(size_t) dev] > 0) {
-            static std::atomic<bool> said{false};
-            if (!said.exchange(true))
-                std::fprintf(stderr, "strata: CUDA%d reports no free memory; sizing it from STRATA_VRAM_FREE_MIB (%lld MiB)\n",
-                             dev, ovr[(size_t) dev]);
-            free_b = std::min((size_t) ovr[(size_t) dev] << 20, total_b);
-        }
-    }
+#if defined(_WIN32)
+    if (free_b == 0) free_b = stated_free_bytes(total_b);
+#endif
     // #1440: own_drm_local_bytes() sums every DRM fd of the process, i.e. both cards on a layer split, and would charge the
     // first card's cache to the second. With more than one GPU it runs only where the driver reports the whole card as
     // free (Arc A750/i915); a one-GPU run keeps the figure it always had.
