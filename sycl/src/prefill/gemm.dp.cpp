@@ -693,18 +693,21 @@ namespace {
 // GEMMs met this and the prompt came out non-finite / garbage.  An operand past 4 GiB is copied into a scratch buffer
 // of the queue's own - a fresh allocation, so at offset 0 - and the GEMM runs on that.  Returns false, so the caller
 // runs the direct GEMM, when neither operand needs staging (the common, correct case).
+// A scratch per QUEUE, not per thread: a thread that issues staged GEMMs on two queues (the prefill queue and a
+// verify window's queue are different objects) has no ordering between them, and one shared scratch raced -
+// sporadic non-finite GU rows that no config could reproduce run to run (2026-10-16, k22 split).
 uint8_t* gemm_stage(size_t need, sycl::queue& q) {
-    static thread_local uint8_t* p = nullptr;
-    static thread_local size_t cap = 0;
-    if (need > cap) {
-        if (p != nullptr) {
+    static thread_local std::unordered_map<sycl::queue*, std::pair<uint8_t*, size_t>> bufs;
+    std::pair<uint8_t*, size_t>& e = bufs[&q];
+    if (need > e.second) {
+        if (e.first != nullptr) {
             q.wait();   // the queue is in-order but asynchronous: a previous staged GEMM may still read p
-            sycl::free(p, q);
+            sycl::free(e.first, q);
         }
-        p = (uint8_t*) sycl::malloc_device(need, q);
-        cap = p != nullptr ? need : 0;
+        e.first = (uint8_t*) sycl::malloc_device(need, q);
+        e.second = e.first != nullptr ? need : 0;
     }
-    return p;
+    return e.first;
 }
 inline bool staged_gemm(sycl::queue& q, void* handle, const uint16_t* W, int lda, const uint16_t* X, int ldb,
                         dpct::library_data_t dt, int64_t N, int64_t T, int64_t K, float alpha, float beta,
