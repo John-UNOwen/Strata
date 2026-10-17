@@ -21,6 +21,10 @@ set "ARMS=k22ref k22mirror6000 k22own4096mirror k22prefill16k k22own4096 k22mirr
 if not "%~1"=="" set "ARMS=%*"
 set "REPEATS=%BENCH_REPEATS%"
 if "%REPEATS%"=="" set "REPEATS=3"
+REM Sessions per arm above; BENCH_RUNS raises the number of runs INSIDE a session (chat/prompt/agent repetitions).
+REM For fault hunting that matters: every storm so far lit inside the chat phase, so more runs = more ignition chances.
+set "RUNSARG="
+if not "%BENCH_RUNS%"=="" set "RUNSARG=--runs %BENCH_RUNS%"
 
 call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" >nul 2>&1
 cd /d "%~dp0"
@@ -48,7 +52,7 @@ set /a IDX+=1
 set /a PORT=8190+IDX
 echo.
 echo ============ arm %~1  session %~2 of %REPEATS%  [port !PORT!] [fresh server, gate on ============
-python tools\strata_bench.py --config "bench\arms\%~1.json" --out "bench\results\arms\%~1" --port !PORT!
+python tools\strata_bench.py --config "bench\arms\%~1.json" --out "bench\results\arms\%~1" --port !PORT! !RUNSARG!
 set RC=!errorlevel!
 if "!RC!"=="3" (
   echo pollution detected in arm %~1 session %~2: this session is void and the rest of arm %~1 is skipped; the ladder continues.

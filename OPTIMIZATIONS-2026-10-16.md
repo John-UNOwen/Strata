@@ -195,6 +195,59 @@ certified baseline. The 32K split11 probe still has no gate-checked prompt numbe
   inside a round and compare an arm against a baseline session from the same hour; `arms_summary.py --sessions`
   prints each arm's drift.
 
+## Fault search: how to diagnose the storm
+
+Detection is solved (the gate plus `tools/arms_logscan.py`). What is missing is localization: which window, which stage,
+which buffer. This is the loop for that.
+
+**The test bed.** The 32K shape stormed 1 in 1 and aborts inside the first chat run, so a polluted session costs
+minutes, not a round: `BENCH-ARMS.bat k22ctx32k <control>` gives the reference and the control back to back.
+
+**The clue we have not used: it is nearly always q3.** Five of the six chat storms lit on the third chat prompt, the
+list prompt ("List ten practical tips..., one sentence each"), and the 21:58 reply was a numbered list item that became
+`!`. That is the content where the draft head proposes whole windows and the verifier accepts all of them, which every
+junk window shows (`drafts accepted 48 of 48`, `29 of 29`) together with a speed spike. So the first hypothesis is the
+**fully accepted verify window path** (`Verifier::copy_` staging plus flag-B doorbell, `verify.cpp:2523-2553`), not the
+A770 layout. The controls below are ordered to test that first.
+
+**Controls** (`python bench/arms/make_arms_k22.py`, one change each against `k22ctx32k`, read them as "did the storm
+rate move", never as speed):
+
+| Arm | Change | A change in the rate proves |
+|---|---|---|
+| `k22ctx32kspec0` | `--spec 0` | the fault lives in the draft/verify path, not prefill or layout |
+| `k22ctx32kspec2` | `--spec 2` | a depth threshold (if 0 is clean and 2 storms, it needs a window big enough to accept fully) |
+| `k22ctx32keager` | `STRATA_VERIFY_EAGER=1` | ordering vs data: eager fails as error 40, graphs as a hang |
+| `k22ctx32kkvf16` | `--kv f16` | the KV arena placement matters as much as the dtype |
+| `k22ctx32ksmallcache` | `STRATA_VRAM_FREE_MIB=0,11000` | buffer placement around the 4 GiB line matters |
+| `b580only32k` | B580 only, all 48 layers | the split, the hand-off and the second card are innocent if it still storms |
+| `a770only32k` | A770 only, all 48 layers | ditto, and which stage manufactures it |
+
+**The instruments** (this engine build carries them: `build-sycl-jit\strata.exe`):
+
+- `STRATA_DBG_WINDOW=1`: one line per verify window, host counters only, no device work and no sync, so the timing
+  inside the window is untouched: `strata window: 41 T=6 accepted=5 pos=1234 FULL-WINDOW (suffix draft)`.
+- `STRATA_DBG_NAN_DEFER=1`: after each commit the head logits of that window are copied and counted, reporting the
+  first bad row and the token its argmax picks. The copy's sync lands **between** windows, not inside one, which is why
+  it should not mask the fault the way `STRATA_DBG_NAN` did in 2 of 2 runs. If a storm still disappears under it, the
+  fault is timing-sensitive in the inter-window gap, and that is itself the finding.
+- Read them together: the first `FULL-WINDOW` line before the first non-finite report localizes the storm to a window.
+  A non-finite row inside a window that was not fully accepted points at the plain forward instead.
+- `STRATA_DBG_NAN` (in-window scans) stays as the last resort only: it perturbs the window, so a clean run with it on
+  proves nothing.
+
+**Recipe** (the shape that already storms, more ignition chances per session):
+```
+set BENCH_TRACE=1
+set BENCH_RUNS=6
+set BENCH_REPEATS=3
+BENCH-ARMS.bat k22ctx32k k22ctx32kspec0
+```
+`BENCH_TRACE=1` makes `make_arms_k22.py` regenerate every arm with both instruments on (it runs inside the ladder), so
+the engine log of the round carries the window trace and any non-finite report. Then read the gate verdict in
+`bench\results\arms\...` and `python tools\arms_logscan.py strata-arm-k22ctx32k.log`. Start with one reference session
+plus one control; add repeats only once the trace shows something.
+
 ## Speed (no MTP)
 
 1. **Mirror the A770 stage's missed experts in pinned RAM.** The largest remaining lever, and still untested.
