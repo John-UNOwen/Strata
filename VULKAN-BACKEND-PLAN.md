@@ -7,16 +7,51 @@ for misses, layer split across the two cards) and is correct where the SYCL / Le
 Status: plan only. Nothing here is built. Each phase ends at a gate; stop and report at a failed gate instead of
 working around it.
 
+## Reviewed against the repo and this PC (2026-10-17)
+
+Branch `vulkan-backend` cut from `main` at `3364fdf`. What the review found, with the file each fact came from:
+
+- **Vulkan already works on both cards.** `vulkaninfo --summary`: A770 = GPU0 (`apiVersion 1.4.359`, `driverVersion
+  101.9150`, `conformanceVersion 1.4.2.0`), B580 = GPU2 (same), UHD 770 = GPU1 (integrated, `1.4.323 / 101.7092`, the
+  one to skip). The loader `C:\Windows\System32\vulkan-1.dll` is there. So P1 is half answered before any code exists:
+  both Arcs enumerate in one instance, and API 1.4 is available where this plan targets 1.3.
+- **One driver package behind both APIs.** `Win32_VideoController` reports B580 and A770 both at `32.0.101.9150`
+  (2026-10-07). The Level Zero front end of that same package reported `1.17.39894+4` in the graph probes
+  (`HANDOFF-WINDOWS-SYCL.md` section 12). So the bet is not "a different driver", it is "the same driver's other front
+  end". That promotes P2 from a nice-to-have to the decisive probe: the known SYCL failure is an allocation that comes
+  back **aliased past 4 GiB** (section 9.3, `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS`), and P2 asks exactly that
+  question through Vulkan. If P2 passes, the >26-layer fault is not a general driver fault.
+- **No Vulkan build toolchain exists on this PC.** No `C:\VulkanSDK`, no `VULKAN_SDK`, no `vulkan.h` in the Windows Kits
+  or Visual Studio trees, no `glslc`, no `glslangValidator`, no `dxc` on PATH. `dxc.exe` does exist at
+  `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe`. 72 GB free on C:. This is a gate of its own,
+  below as "Phase 0 preconditions".
+- **`third_party/ggml` does not carry ggml-vulkan, or ggml.** That directory holds `ggml-common.h` (134 KiB), `LICENSE`
+  and `VERSION.txt` (commit `3cf0325`, 2026-09-20) and nothing else. Phase 3's starting point is therefore a download of
+  `ggml/src/ggml-vulkan` (MIT, ask first, pin the commit), not something already in the tree.
+- **The llama.cpp evidence, with citable files.** VicGPT's auto-fit run,
+  `VicGPT/logs/vulkan-flashnext-auto_2026-10-16_235849.log.stderr` (321 lines), records `Vulkan0 (A770): 36 layers (22
+  overflowing), 13802 MiB used, 1623 MiB free`, `offloaded 49/49 layers to GPU`, `Vulkan0 model buffer 13190 MiB`,
+  `Vulkan2 (B580) model buffer 9272 MiB`, and two `CPU_Mapped` totals of 37,034 and 27,466 MiB, which is the 64.5 GiB
+  mapped on 32 GB of RAM. Its output artifact is `VicGPT/benchmarks/vulkan-flashnext-auto_2026-10-17_000222.md`, a
+  coherent digest. Launcher: `VicGPT/scripts/test_vulkan_flashnext.ps1`. The **45-49 / 5.3-5.6 tok/s figures of this
+  plan are in no file in either repo**: re-run that test and keep its report before quoting them as measured.
+- **Counts corrected.** `include/strata/kernels/*.hpp` is 51 files, not 52. `native_head.hpp` is at
+  `include/strata/core/native_head.hpp`. The doorbell this plan names is `sycl/include/strata/sycl_doorbell.hpp`, a
+  SYCL-only file; Vulkan needs its own. `metal/src/engine` is 14 files / 5,227 lines, `stubs.cpp` is 367 lines holding
+  198 `strata::kernels::` stubs, and the shader trees total 5,837 lines. `metal/src/gpu/runtime.cpp` is exactly 640
+  lines, and `metal/include/metal_compat/` is the three headers named below. `sycl/src/kernels/*_parity.cpp`: 38 oracles.
+
 ## Why, and what this plan does not claim
 
 - **SYCL engine today** (k22 split, B580 layers 0-21, A770 22-47): prompt 260-320 tok/s, decode 18-25 tok/s, clean.
   More layers on the A770 measured up to ~2x faster in short runs (split11: 621 / 851 prompt at 4K / 16K, 35.5
   decode, commit `2ccc945`), but those runs produce NaN: 37 A770 layers fail, 32 fail with images, 26 are clean
   (`OPTIMIZATIONS-2026-10-16.md`, "Where things stand").
-- **llama.cpp Vulkan on the same model and PC** (b11576, 2026-10-17, VicGPT `logs/vulkan-flashnext-auto_2026-10-17_000222.log`):
-  a clean, coherent digest with **36 layers on the A770**, but prompt 45-49 tok/s and decode 5.3-5.6 tok/s. Its
-  slowness is llama.cpp's memory layout: no hot-expert cache, 22 layers' experts on the CPU, 64 GB mapped on 32 GB of
-  RAM so decode pages from the SSD. It is not evidence about Vulkan kernels.
+- **llama.cpp Vulkan on the same model and PC** (VicGPT's auto-fit run, cited file by file in the review above): a
+  clean, coherent digest with **36 layers on the A770** and 49/49 offloaded across the two cards, but prompt 45-49 tok/s
+  and decode 5.3-5.6 tok/s (those two figures are remembered, not in a file, and need a re-run before they are quoted).
+  Its slowness is llama.cpp's memory layout: no hot-expert cache, 22 layers' experts on the CPU, 64.5 GiB mapped on 32
+  GB of RAM so decode pages from the SSD. It is not evidence about Vulkan kernels.
 - **So the bet is:** Vulkan's driver path may not have the >26-layer fault, and Strata's layout is what makes this
   model fast. Both halves are n=1 or inferred. Phase 0 tests the first half for about a week of work; Phase 2 tests
   whether Vulkan kernels are fast enough. Do not start Phase 3 before both gates pass.
@@ -51,8 +86,8 @@ host code: `src/core/*`, `src/program/generate.cpp`) **unchanged**, with three p
 |---|---|---|
 | `metal/include/metal_compat/cuda_runtime.h` | Maps every CUDA runtime name the host code uses (`cudaStream_t`, `cudaMalloc`, `cudaGraphLaunch`, ...) onto `strata::gpu`. Goes first on the include path. Only names the host code really uses; anything else fails to compile, on purpose | `vulkan/include/vulkan_compat/cuda_runtime.h`, same inventory, same rule |
 | `metal/src/gpu/runtime.cpp` (640 lines) | The `strata::gpu` runtime: devices, memory, streams, events, graphs | `vulkan/src/gpu/runtime.cpp` over Vulkan 1.3 |
-| `metal/src/engine/*` (4,247 lines) + kernels (5,586 lines of MSL) | The kernel library: the entry points the host code calls, implemented for Metal. A verify window is encoded as one dependency graph in one command buffer (`window.cpp`) | `vulkan/src/engine/*` + compute shaders (GLSL, compiled to SPIR-V with `glslc`) |
-| `metal/tools/gen_stubs.py` + `stubs.cpp` (248 stubbed entry points) | Every entry point not ported gets a stub that stops the engine with its name, generated from the failed link | Same tool, adapted to MSVC's link errors ("unresolved external symbol"), so the engine links on day one |
+| `metal/src/engine/*` (14 files, 5,227 lines) + kernels (5,837 lines of MSL) | The kernel library: the entry points the host code calls, implemented for Metal. A verify window is encoded as one dependency graph in one command buffer (`window.cpp`) | `vulkan/src/engine/*` + compute shaders (GLSL, compiled to SPIR-V with `glslc`) |
+| `metal/tools/gen_stubs.py` + `stubs.cpp` (367 lines, 198 `strata::kernels::` stubs) | Every entry point not ported gets a stub that stops the engine with its name, generated from the failed link | Same tool, adapted to MSVC's link errors ("unresolved external symbol"), so the engine links on day one |
 
 Why the CUDA host tree and not the SYCL tree: `sycl/` is a dpct migration with SYCL types throughout its host code;
 `src/` is the upstream host code, already proven portable twice (HIP through `hip_compat`, Metal through
@@ -70,19 +105,50 @@ How Strata's mechanisms map to Vulkan:
 | `dp4a`, sub-group shuffles, XMX `joint_matrix` | `VK_KHR_shader_integer_dot_product`, subgroup operations + `VK_EXT_subgroup_size_control` (Arc: 8/16/32), `VK_KHR_cooperative_matrix` for XMX | XMX is a prompt-speed item for Phase 5, not needed for correctness |
 | oneMKL / cuBLAS GEMMs in the prompt path | Own GEMM shaders. Starting point: llama.cpp's `ggml-vulkan` shaders (MIT, `third_party/ggml` already carries ggml), including its IQ2_XS dequantization and `mul_mm` | Keep the license header; note the source commit |
 
+## Phase 0 preconditions: the toolchain (its own gate, needs your call)
+
+Nothing in this plan can be compiled today. Verified absent: the Vulkan SDK, `VULKAN_SDK`, `vulkan.h`, `glslc`,
+`glslangValidator`. Verified present: the loader `vulkan-1.dll`, `vulkaninfo.exe`, `dxc.exe` in the Windows Kits, and
+the oneAPI/MSVC toolchain the SYCL engine already builds with. Three ways in, in the order I would take them:
+
+| Route | What it installs | Cost | What it costs us later |
+|---|---|---|---|
+| **A. Vulkan SDK** (recommended, and what this plan assumes) | Khronos SDK via `winget install KhronosGroup.VulkanSDK`; headers, `vulkan-1.lib`, `glslc`, validation layers, `vulkaninfo` | about 250-300 MB download, about 1 GB on disk (72 GB free) | none; Phases 1-3 want the same tools, and the validation layer is what makes a bad descriptor visible instead of a mystery |
+| **B. Clone and build** | Khronos `Vulkan-Headers` (about 4 MB) vendored under `third_party/`, plus `glslang`, `SPIRV-Tools`, `SPIRV-Headers` built from source with the installed compiler | four clones, a 5-10 minute build, no installer | no validation layer; glslang must be rebuilt if the toolchain moves |
+| **C. `dxc` from the Windows Kits + cloned headers** | only `Vulkan-Headers` cloned; shaders written in HLSL and compiled with `dxc -T cs_6_0 -spirv` | smallest download | HLSL has no clean way to hold a 64-bit device address in a shader, which is exactly what P2 and the engine's `ptr2` tables need; the later phases would then be written in a language the port does not use |
+
+Route C is not acceptable for P2. If no install is wanted, B is the fallback, and the shaders stay GLSL.
+
+Whichever route is chosen, record it here as done before the probe is built, because the probe's CMake is the same
+build skeleton Phase 1 needs (`find_package(Vulkan)`, `glslc` for `vulkan/shaders/*.comp`, SPIR-V embedded as byte
+arrays).
+
 ## Phase 0: capability probe (gate, no engine code)
 
 One standalone program, `vulkan/probe/vk_caps_probe.cpp`, built with the Vulkan SDK, runs on both cards in one
 process, prints a table, exits. Each test is bounded (a few seconds). The user runs it.
 
 - [ ] **P1. Devices and limits.** Both Arcs enumerate in one `VkInstance` (the UHD 770 is skipped). Print per card:
-  driver version, `maxMemoryAllocationSize`, `maxStorageBufferRange`, `maxBufferSize` (`VK_KHR_maintenance4`), the
-  memory heaps and types (device-local, host-visible, host-coherent, host-cached), subgroup sizes, and the
-  extensions in the mapping table above.
+  driver version, `maxMemoryAllocationSize`, `maxStorageBufferRange`, `maxBufferSize` (`VK_KHR_maintenance4`),
+  `maxMemoryAllocationSize`, `bufferDeviceAddressAlignment`, `minImportedHostPointerAlignment`
+  (`VK_EXT_external_memory_host`), the memory heaps and types (device-local, host-visible, host-coherent, host-cached)
+  with each heap's size, subgroup sizes, and the extensions in the mapping table above.
+  - Also print, per card, `VK_EXT_memory_budget` if present (budget and current usage per heap). The spill rule of this
+    PC is about **dedicated** memory (`HANDOFF-WINDOWS-SYCL.md` section 1), and Vulkan host-visible buffers read as
+    shared memory, so the probe needs a per-card dedicated number of its own. `VK_EXT_memory_budget` gives it from
+    inside the API; DXGI by LUID is the cross-check the SYCL engine already uses (`sycl/src/core/pinned.dp.cpp`,
+    `dxgi_local_memory`), remembering section 11: the A770 answers twice in DXGI on this PC, so match by LUID/UUID and
+    say which one was read.
 - [ ] **P2. A 7 GiB device allocation on the A770,** read and written past 4 GiB through buffer device address:
   write a tag every 64 MiB from a shader, read it back from the host through a copy, and from a second shader.
   All tags right = pass. This is the Vulkan twin of the SYCL A770 4 GiB problem (`HANDOFF-WINDOWS-SYCL.md` section 9.3).
   If one allocation is refused, try 2 x 3.5 GiB and record the limit.
+- [ ] **P2b. The same buffer bound past 4 GiB the ordinary way.** A shader reads and writes through a buffer *view*
+  created at an offset of 5 GiB (`vkCmdBindDescriptorSets` with `offset`), with no buffer device address, and a second
+  one reads at `offset + 64 MiB`. Record `maxStorageBufferRange` next to what actually worked. This is the question the
+  SYCL engine paid for: borrowed prompt operands past 4 GiB needed `staged_gemm` on the A770. If P2b works, Phase 3's
+  "addressed by pointer, so no staging copy" claim is proven on this driver by the cheaper mechanism too. If it fails
+  while P2 passes, only the pointer path is usable and every borrowed operand must come through an address.
 - [ ] **P3. One host buffer, both cards.** `VirtualAlloc` 1 GiB, fill a pattern, import it with
   `VK_EXT_external_memory_host` into the B580's device **and** the A770's device; a shader on each reads it in place
   and writes a checksum. Then each card writes its own half and the other card reads it after a host-side wait.
@@ -96,9 +162,12 @@ process, prints a table, exits. Each test is bounded (a few seconds). The user r
 - [ ] **P6. Cooperative matrix and integer dot product.** List the supported cooperative matrix shapes and types per
   card (fp16 and int8), and whether 4x8-bit packed integer dot product is accelerated.
 
-**Gate 0:** P1, P2, P4, P5 pass on both cards. P3 decides the cross-card design (shared or copied), P6 decides
-Phase 5's scope. Write the results to `bench/results/vulkan-caps-<date>.md`. If P2 fails on the A770 with no
-workaround, stop: the expert cache cannot live there.
+**Gate 0:** P1, P2, P2b, P4, P5 pass on both cards. P3 decides the cross-card design (shared or copied), P6 decides
+Phase 5's scope. Run the probe **three times with a full exit between runs** and require the same verdict three times:
+the fault this plan is chasing was intermittent on the SYCL side, and a capability probe that passes once is exactly the
+single clean run this PC has taught us not to trust. Write the three runs to `bench/results/vulkan-caps-<date>.md`. If
+P2 fails on the A770 with no workaround, stop: the expert cache cannot live there. If P2 passes but P2b fails, write it
+down: it means Phase 3 must route every borrowed operand through an address, which is a design decision, not a detail.
 
 ## Phase 1: skeleton that links
 
@@ -142,6 +211,12 @@ entry points a working engine needed: its 248 stubs are the ones it did not.
 - **Gate 2, speed:** decode within 1.5x of the SYCL A770-alone figure (14-21 tok/s, README) on the same prompt and
   cache size, N = 3, pollution gate clean. Slower than that with no identified cause = stop and report: the port's
   premise needs the kernels to be competitive.
+- **Missing piece the first draft did not name:** the pollution gate lives in `tools/strata_bench.py`, which starts the
+  engine through `serve/server.py --engine strata --config <cfg>`. For Gate 2 to be measurable at all, the Vulkan build
+  must produce a `strata.exe` that `--serve` speaks the same loop, or a small standalone driver that emits the same
+  `strata serve: prompt ... drafts accepted ...` lines the gate and `tools/arms_logscan.py` parse. Decide that at the
+  end of Phase 1, not at Phase 2: it is a host-side job, it is small, and without it nothing in Phase 2 can be called
+  clean.
 
 ## Phase 3: prompt path, one card
 
@@ -164,10 +239,16 @@ entry points a working engine needed: its 248 stubs are the ones it did not.
 - [ ] Run the split ladder with real traffic, text and images, pollution gate on, N >= 3 each:
   k22 (26 A770 layers), split16 (32), split11 (37).
 - **Gate 4 (the reason for this plan):** split11 and split16 clean on Vulkan, N >= 3, with text and with images.
-  - Clean: record speed against SYCL k22 (260-320 / 18-25) and the split11 ceiling (621-851 / 35.5). This is the
-    result to take to the user.
+  - Clean and faster: record speed against SYCL k22 (260-320 / 18-25) and the split11 ceiling (621-851 / 35.5). This is
+    the result to take to the user.
+  - Clean but **not** faster than SYCL k22: then the port bought correctness, not speed. Say so plainly, and the cheaper
+    alternative (finding the fault inside SYCL, `OPTIMIZATIONS-2026-10-16.md` "Fault search") becomes the main line
+    again rather than a footnote.
   - Same NaN at the same layer counts: the fault is not the driver path. Stop, report, and hand the evidence to the
     SYCL NaN hunt.
+  - **Measure against a same-hour baseline.** Two-card numbers on this PC drift 5-7% across an evening with no config
+    change (`OPTIMIZATIONS-2026-10-16.md`, "Baseline round"). A Vulkan run at 21:00 compared with a SYCL run at 19:30 is
+    not a comparison: run the SYCL arm in the same block, interleaved, or the verdict is noise.
 
 ## Phase 5: speed (only after Gate 4)
 
@@ -178,13 +259,31 @@ entry points a working engine needed: its 248 stubs are the ones it did not.
 - Launcher `start-strata-vulkan-split11.bat` and a config; the SYCL launchers stay the default until Vulkan wins
   Gate 4 and a VicGPT A/B.
 
+## First steps on this branch, in order
+
+1. The toolchain decision above, recorded as done. Nothing builds before it, and it is yours to make or to refuse.
+2. `feat: vulkan probe build`: `vulkan/CMakeLists.txt` (probe target only, `find_package(Vulkan)`, `glslc` rules),
+   `vulkan/tools/embed_spv.py` (SPIR-V to byte arrays), `start-vulkan-probe.bat` (build, run, write
+   `bench/results/vulkan-caps-<run>.log`). No engine code. The CUDA, HIP and SYCL builds and the top-level
+   `CMakeLists.txt` stay untouched.
+3. `feat: vulkan capability probe`: `vulkan/probe/vk_caps_probe.cpp`, one test per function, each switchable
+   (`--only p2b,p3`), every allocation bounded and freed, `--limit-gib` and `--host-mib` so the first pass can start
+   small on a machine you are watching, and a printed per-card dedicated-memory line from P1.
+4. `feat: vulkan probe shaders`: `vulkan/probe/shaders/*.comp` (tag write, tag read, checksum, half write, no-op
+   dispatch, bounded spin).
+5. You run `start-vulkan-probe.bat` three times, with a full exit between runs. Seconds each, no model load, and I do
+   not run it. I read the logs, write `bench/results/vulkan-caps-<date>.md`, and either tick Phase 0 here or stop the
+   plan at the gate that failed and report which one.
+
+
+
 ## Rough sizes (for planning, not commitments)
 
 | Phase | Work | Comparable |
 |---|---|---|
 | 0 | One probe program, ~600-900 lines | the SYCL probes in `C:\strata-deps\` |
 | 1 | Compat header + runtime + build, ~1,500-2,500 lines | Metal: 640-line runtime + compat header |
-| 2 | Decode kernels + parity tests | Metal's decode share of its 5,586 lines of shaders |
+| 2 | Decode kernels + parity tests | Metal's decode share of its 5,837 lines of shaders |
 | 3 | Prompt kernels | the rest of that, plus GEMMs (ggml-vulkan as a base) |
 | 4 | Mostly host glue and testing | the SYCL split work of 2026-10-15/16 |
 
@@ -195,7 +294,10 @@ entry points a working engine needed: its 248 stubs are the ones it did not.
 - `docs/INTEL_WINDOWS.md`: the Windows runbook (configs, env, launchers).
 - `docs/MAC.md`, `metal/CMakeLists.txt`, `metal/include/metal_compat/cuda_runtime.h`, `metal/src/gpu/runtime.cpp`,
   `metal/src/engine/window.cpp`, `metal/tools/gen_stubs.py`: the port template.
-- `include/strata/kernels/*.hpp` (52 headers): the kernel entry points to implement.
+- `include/strata/kernels/*.hpp` (51 headers) plus `include/strata/core/native_head.hpp`: the kernel entry points to implement.
 - `sycl/src/kernels/*_parity.cpp`: parity oracles and tolerances.
-- The VicGPT note `llama.cpp Vulkan on Flash-Next IQ2_XS, this PC (2026-10-17)` and
-  `scripts/test_vulkan_flashnext.ps1`: the test behind this plan, and its launcher gotchas.
+- The VicGPT test behind this plan, on this PC: `VicGPT/scripts/test_vulkan_flashnext.ps1`,
+  `VicGPT/logs/vulkan-flashnext-auto_2026-10-16_235849.log.stderr` (the fit: 36 layers on the A770, 64.5 GiB mapped),
+  `VicGPT/benchmarks/vulkan-flashnext-auto_2026-10-17_000222.md` (the coherent digest), and
+  `VicGPT/benchmarks/sycl-vs-vulkan_2026-10-15_082834/` for the earlier llama.cpp Vulkan runs (those are qwen35 27B
+  Q4_K, not this model).
