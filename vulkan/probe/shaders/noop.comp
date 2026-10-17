@@ -1,0 +1,13 @@
+#version 450 core
+// P4 filler: one trivial store, used to build a 2,400 dispatch command buffer.
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint tag; uint count; uint a; uint b; } pc;
+
+layout(set = 0, binding = 0, scalar) buffer Sink { uint v[]; } sink;
+
+void main() {
+    sink.v[0] = pc.tag;
+}

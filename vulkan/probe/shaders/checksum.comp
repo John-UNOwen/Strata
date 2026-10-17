@@ -1,0 +1,21 @@
+#version 450 core
+// P3 read pass: read samples out of a buffer whose memory is a host allocation, bound in place.
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct Row { uint64_t ok; uint64_t val; };
+
+layout(push_constant) uniform PC { uint stride; uint count; uint a; uint b; } pc;
+
+layout(set = 0, binding = 0, scalar) buffer Host { uint64_t w[]; } hb;
+
+layout(set = 0, binding = 1, scalar) buffer Out { Row row[]; } outb;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) { return; }
+    outb.row[i].ok = 1ul;
+    outb.row[i].val = hb.w[(pc.stride / 8u) * i];
+}

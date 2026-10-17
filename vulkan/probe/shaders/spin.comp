@@ -1,0 +1,29 @@
+#version 450 core
+// P5: the doorbell shape. One invocation polls host coherent memory until the host raises the
+// flag or the budget runs out, then reports how long it had been spinning.
+// The reads are coherent and volatile so the driver may not hoist them out of the loop, and the
+// accumulator depends on every read so the load cannot be removed.
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint max_spins; uint a; uint b; uint d; } pc;
+
+layout(set = 0, binding = 0, scalar) coherent volatile buffer Flag { uint flag; } fb;
+layout(set = 0, binding = 1, scalar) buffer Res { uint spins; uint seen; uint acc; uint pad; } res;
+
+void main() {
+    uint spins = 0u;
+    uint seen = 0u;
+    uint acc = 0u;
+    while (spins < pc.max_spins) {
+        uint f = fb.flag;
+        acc += f;
+        if (acc != 0u) { seen = 1u; break; }
+        ++spins;
+    }
+    res.spins = spins;
+    res.seen = seen;
+    res.acc = acc;
+    res.pad = 0u;
+}
