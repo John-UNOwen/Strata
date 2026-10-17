@@ -326,6 +326,62 @@ reads as well as writes, and the doorbell replacement (timeline semaphore or a n
 
 
 
+## Phase 1 result (2026-10-17): the skeleton links
+
+Opt-in under `vulkan/` like `metal/`; `src/`, `sycl/`, `metal/` and the top-level `CMakeLists.txt`
+untouched. Configured and built on this PC with the Visual Studio 18 2026 generator:
+
+- `cmake -S vulkan -B build-vulkan-check -DCMAKE_BUILD_TYPE=Release -DSTRATA_VULKAN_ENGINE=ON` exits 0:
+  `Found Vulkan ... 1.4.363 ... components: glslc glslangValidator`, and ggml from a llama.cpp checkout
+  verified at the commit `third_party/ggml/VERSION.txt` pins (`3cf03257f219...`).
+- The shared host tree compiles through `vulkan/include/vulkan_compat/cuda_runtime.h`: of the 221 files
+  in `src/` (144 `.cpp`) the build compiles 42 engine `.cpp`, 100 harness `.cpp`, and one host `.cu` as
+  C++; the 63 `.cu` with device code are not compiled, because those launches are what SPIR-V replaces.
+- `--build ... --config Release` exits 0 and produces `strata.exe` (4,189,184 bytes),
+  `strata-device.exe`, `strata_vk_smoke.exe`, `stub_probe.exe`, `vk_caps_probe.exe`.
+- `strata.exe --help` exits 0 with 245 lines; `strata.exe --families` exits 0 and prints `qwen4exp`.
+  The exe is the same `src/program/generate.cpp` CLI as the SYCL engine, `--serve` included, so
+  `tools/strata_bench.py` and `tools/arms_logscan.py` drive the Vulkan build unchanged. Gate 2 needs no
+  new harness.
+- The engine's kernel entry points are 281 generated stubs (`vulkan/src/engine/stubs.cpp`, from
+  `vulkan/tools/gen_stubs.py` reading MSVC's unresolved external lines). `stub_probe.exe` exits 3 after
+  printing `strata vulkan: stub reached: no Vulkan implementation for "strata::kernels::add_inplace"`.
+  Nothing is dispatched and nothing is pretended.
+- `strata_vk_smoke.exe` exits 0 printing `strata_vk_smoke OK: 0 failure(s)` with the Khronos layer on
+  and 0 validation errors in its own transcript. It selects the two Arcs and skips the UHD 770, echoes
+  the Phase 0 limits per card (`maxStorageBufferRange 4095 MiB`, `maxMemoryAllocationSize 4095 MiB`,
+  `minStorageBufferOffsetAlignment 64`), builds a `noop` pipeline from `vulkan/shaders/noop.comp`, and
+  checks the runtime answers it provides.
+- `cmake -S vulkan -B ... -DSTRATA_VULKAN_ENGINE=OFF` keeps the Phase 0 route intact: that build
+  produces `vk_caps_probe.exe` and nothing else.
+
+The runtime (`vulkan/src/gpu/runtime.cpp`, `vulkan/include/strata/gpu/runtime.hpp`) answers today: two
+Arc devices chosen by `VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU`; a sub-allocator whose blocks and single
+storage bindings are clamped to 4095 MiB and whose offsets are free, including past 4 GiB, aligned to
+`minStorageBufferOffsetAlignment`; host mapped memory, `cudaHostAlloc`/`cudaHostRegister` imports
+through `VK_EXT_external_memory_host`; streams as queues with submits in submission order; events as
+timeline semaphores; a captured graph replayed by re-encoding its node list into the one
+`VkCommandBuffer`; `cudaMemGetInfo` from `VK_EXT_memory_budget` (the A770 reports 15489 MiB total, the
+heap budget, minus this process's own usage). An entry point with no SPIR-V is named and refused, never
+faked. Host to GPU signalling is a submit (`nudge_submit`), GPU to host is a timeline value
+(`wait_timeline`), because Phase 0 measured that a polled flag never becomes visible.
+
+Where Phase 2 plugs in: `strata::gpu::register_pipeline` (a `.comp` under `vulkan/shaders/`, built by
+`vulkan/CMakeLists.txt` into SPIR-V and a generated header) and `strata::gpu::launch_kernel`. The
+argument contract, read off `record_dispatch`: the first `storage_bindings` uint64 words of the argument
+blob become storage-buffer bindings in argument order, at the address's own offset inside its allocation
+(offset may be past 4 GiB) with the range clamped to the card's 4095 MiB block limit; the whole blob is
+also pushed as push constants up to `maxPushConstantsSize` (256 B here); `cfg.grid` is the workgroup
+count and the SPIR-V's `local_size` is the workgroup size.
+
+Handoff notes for whoever picks up Phase 2: the engine asked for more streams than the A770's 4 compute
+queues, and the runtime shares a queue for the extras as a serialized submit chain; check whether that
+ordering is what the expert-parallel code expects before blaming a kernel for a stall. Push constants cap
+at 256 B, so a kernel with a wider parameter block needs `STRATA_VULKAN_UNIFORM_PARAMS=1` (the uniform
+buffer path, refused by default) rather than a wider push block. The 4095 MiB binding clamp is per
+binding, so a tensor bigger than that needs several allocations, not one.
+
+
 ## Rough sizes (for planning, not commitments)
 
 | Phase | Work | Comparable |
