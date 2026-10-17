@@ -9,12 +9,14 @@ web app as the CUDA engine. Written for and measured on an Arc B580 (12 GB) + Ar
 
 - **Single card**: B580 alone or A770 alone, full 64K-128K context serving.
 - **Two Arc cards, mixed generations, the 22/26 layer split** (`--layer-split 22`, called k22): B580 layers 0-21,
-  A770 layers 22-47. Reliable for text and for pictures (the vision encoder runs on the CPU). Measured IQ2_XS at
-  64K context: **18-25 tokens/s decode**, prompt reads 260-320 tokens/s, drafts accepting up to ~86% on good
-  prompts. 128K context also starts and serves.
+  A770 layers 22-47. Works for text and for pictures (the vision encoder runs on the CPU). Benchmark-certified
+  IQ2_XS at 64K context (pollution-gated suite, 2026-10-16): **23 tokens/s decode**, prompt reads **377 tokens/s
+  (4K) / 618 (16K)**, drafts accepting up to ~86% on good prompts. 128K context also starts and serves.
 - **Deeper A770-heavy splits are the open frontier**: a 32-layer A770 side (split16) ran text-only clean but NaNs as
-  soon as pictures enter; the 37-layer side (split11) NaNs text at 64K and at 32K. See the fault-shape update under
-  caveats - the frontier tracks how many layers the Alchemist card holds, not chunk size or staging.
+  soon as pictures enter; the 37-layer side (split11) NaNs text at 64K and at 32K. The frontier is not purely the
+  layer count either: in the gated ladder k22 itself produced storm sessions at 32K context and at 16384-token
+  prompt chunks, while 64K with the default chunks ran clean. Treat "clean" as per-shape, and re-check any new
+  context or chunk size with the gate (N>=3).
 - Built-in drafts (speculation windows, `--spec 4`) work on all of these. The optional MTP drafter is **parked on
   the two-card Windows path** (see caveats).
 

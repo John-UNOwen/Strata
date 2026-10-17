@@ -25,12 +25,11 @@ arms on them mixes speed with a moving fault. **k22 daily numbers** (`start-2car
 now): prompt 260-320 tok/s, decode 18-25, suffix drafts up to ~86% accepted. k22 also serves images (CPU encoder,
 280-297 tok/s map prompts): at k22 the bigger B580 share no longer buys prompt speed, so the frontier costs little today.
 
-Against VicGPT's bar and the old llama.cpp Vulkan model (the two-card numbers below are pollution-unverified, see the
-gate note; the k22 evening numbers are post-fix):
-- **Prompt:** k22 benched 367 (4K) / 616 (16K) tok/s (table below, suspect era); its post-fix map-sized 8-18K warm
-  reads run 260-320. The split11-class 851 is the number the frontier hunt could restore.
-- **Decode:** k22 18-25 tok/s (post-fix) is about 1.2-1.5x llama.cpp's ~16.
-- **A 10k-token map chunk** reads in about 30-38 s at k22 (was 12-16 s at split11).
+Against VicGPT's bar and the old llama.cpp Vulkan model (two-card numbers now gate-certified by k22ref):
+- **Prompt:** k22 377 (4K) / 618 (16K) tok/s; its map-sized 8-18K warm reads run 200-290. llama.cpp ran 380-420 at
+  16K, so k22 is ahead but the split11-class 851 remains the number the frontier hunt could restore.
+- **Decode:** k22 22.9 tok/s is about 1.4x llama.cpp's ~16.
+- **A 10k-token map chunk** reads in about 30-45 s at k22 (was 12-16 s at split11).
 
 **Arms for the k22 baseline**: `python bench/arms/make_arms_k22.py` writes the configs; `BENCH-ARMS.bat` (repo root)
 then runs the whole ladder automatically - each arm on its own fresh server and port (8191+), 3 runs each, pollution
@@ -38,6 +37,39 @@ gate on every reply, summary table of all arms at the end (`tools/arms_summary.p
 k22ref). One arm alone: `bench/arms/run-arm.bat k22mirror6000`.
 `k22ref`, `k22mirror6000`, `k22mirror10000`, `k22prefill16k`, `k22own4096`, `k22own4096mirror`, `k22ctx32k`, `k22ctx32kmirror`.
 The old split11-based arms (`make_arms.py`) stay for the frontier hunt itself.
+
+### First gated ladder (fresh data, exe 17:45 build, run 2026-10-16 ~21:20)
+
+Every number below is new, gate-checked, one fresh server per arm:
+
+| Arm | Decode tok/s | 4K | 16K | Polluted replies | Verdict |
+|---|---:|---:|---:|---:|---|
+| **k22ref** | **22.9** | **377** | **618** | 0 | the valid baseline |
+| k22mirror6000 | 22.7 | 361 | 607 | 0 | mirror is neutral (-1 to -4%) |
+| k22mirror10000 | 22.1 | 365 | 610 | 0 | neutral |
+| k22prefill16k | - | - | - | 7 | void (storms from chat run 2; 4 draft collapses) |
+| k22own4096 | 16.3 | 498 | 702 | 0 | real trade: +32%/+14% prompt, -29% decode |
+| k22own4096mirror | 17.9 | 500 | 706 | 0 | same prompt win, -22% decode |
+| k22ctx32k | - | - | - | 32 | void (storms from chat run 1; its +66% "win" is garbage) |
+| k22ctx32kmirror | - | - | - | 22 | void |
+
+What this settles:
+1. **k22ref 22.9 / 377 / 618 is the certified baseline.** It nearly repeats the suspect-era k22 row (21.7 / 367 / 616),
+   so the k22 arms of the morning era were probably clean even though the split11-era rows were not.
+2. **The pinned-RAM mirror is dead as a k22 lever** at 64K: 6000 and 10000 MiB both land within noise. (It mattered
+   for split16's bigger B580 share; k22's hot experts are already cached.)
+3. **own4096 (no borrow, 4096 chunks) is the one measured win for prompt-heavy use**: +32% at 4K, +14% at 16K, paid
+   for with -29% decode. A VicGPT decision: map reads faster, answers slower.
+4. **k22 is not shape-invariant clean.** Storms appeared inside 3 of 8 k22 sessions: at 32K context (32 polluted
+   replies, starting in the first chat run) and at 16384-token prompt chunks (7). The clean shape that ran was
+   64K with the default auto (8192) chunks. The ">26 layers" frontier story needs a revision: buffer/pool shape, not
+   only the layer count, decides whether the A770 stage manufactures NaN windows.
+5. **The gate works**: ctx32k's apparent +66%/+58% speed would have been logged as the biggest win of the day by the
+   old bench. It was 32 `!`x100 replies.
+
+Next measurements (all plain launchers, N>=3 sessions): `BENCH-ARMS.bat k22ref k22ref k22ref`-style repeats to get
+per-shape storm *rates* (64K-auto vs 32K vs 16384-chunks), then a DBG-scan capture run on whichever shape storms
+accepting the masking caveat. The mirror arms can be dropped from the default ladder.
 
 **These morning numbers are pollution-unverified and now treated as suspect.** They were benched 06:2x-07:42 on the
 engine *before* the scratch-race fix (`9953a5b`, ~09:45), i.e. the version that provably NaN'd split11-class runs in

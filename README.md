@@ -54,7 +54,7 @@ Intel Arc on Windows (built from source, engine 0.1.44.1, IQ2_XS, measured 2026-
 | --- | ---: | ---: |
 | Arc B580 (12 GB) alone | 10 tokens/s | ~100 tokens/s |
 | Arc A770 (16 GB) alone | 14-21 tokens/s | 90-130 tokens/s |
-| Arc B580 + Arc A770 (two cards, 22/26 layer split) | 18-25 tokens/s | 260-320 tokens/s |
+| Arc B580 + Arc A770 (two cards, 22/26 layer split) | 23 tokens/s | 380-620 tokens/s |
 
 The two-card split also reads pictures (the picture work runs on the processor). Deeper splits that give the A770
 more layers measured faster in short tests but are a known open problem today: [Intel Arc on Windows](docs/INTEL_WINDOWS.md).
