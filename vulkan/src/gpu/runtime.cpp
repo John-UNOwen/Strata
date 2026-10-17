@@ -55,9 +55,9 @@
 // devices the selection kept and the ones it dropped with the reason each got, the limits, the heaps with their budget
 // and usage, and the import alignment.  STRATA_VULKAN_SELFCHECK=0 silences it.
 // The environment switches this runtime reads (STRATA_VULKAN_SELFCHECK, STRATA_VULKAN_IGNORE_ALLOC_LIMIT,
-// STRATA_VULKAN_GRAPH_REUPLOAD) are read with getenv, which MSVC deprecates by name rather than by use; this is the
-// line that says so before any system header is pulled in, instead of /D on the target where the next file would hit
-// the same C4996.
+// STRATA_VULKAN_GRAPH_REUPLOAD, STRATA_VULKAN_TRACE_DISPATCH) are read with getenv, which MSVC deprecates by name
+// rather than by use; this is the line that says so before any system header is pulled in, instead of /D on the target
+// where the next file would hit the same C4996.
 #if defined(_MSC_VER)
 #  define _CRT_SECURE_NO_WARNINGS 1
 #endif
@@ -543,6 +543,17 @@ uint64_t block_limit(const Device& d) {
 // default is the conformant one, which is what the plan's finding 4 says a portable port must do.
 bool ignore_alloc_limit() {
     static const bool on = env_on("STRATA_VULKAN_IGNORE_ALLOC_LIMIT", false);
+    return on;
+}
+
+// STRATA_VULKAN_TRACE_DISPATCH=1 prints, on stderr, the storage-buffer binding every dispatch actually wrote: which
+// buffer, at what offset inside it, over how large a range.  It exists because those three numbers - not the pointer a
+// caller was handed - are what a kernel reads, and a binding that landed somewhere unexpected is the failure mode the
+// sub-allocator can produce silently (an allocation placed in a different block than the caller expected, a range
+// clamped by bind_span).  vulkan/probe/vk_add_parity.cpp turns it on to report the offset its past-4-GiB case reached.
+// Off by default: it prints per dispatch, which is not something an engine run wants.
+bool trace_dispatch() {
+    static const bool on = env_on("STRATA_VULKAN_TRACE_DISPATCH", false);
     return on;
 }
 
@@ -1396,10 +1407,16 @@ Error build_pipeline(Device& d, const PipelineSpec& spec, std::string& why) {
     return kSuccess;
 }
 
-VkDescriptorSet chain_set(Chain& c, Pipeline& p, Device& d) {
-    auto it = c.sets.find(p.key);
-    if (it != c.sets.end()) return it->second;
+// The descriptor set one dispatch binds, taken from this pipeline's own pool and kept per (pipeline, target) pair: a
+// chain slot and a replayed graph exec each hold their own map, so a replay never rewrites the sets a live chain is
+// still holding.  VK_ERROR_OUT_OF_POOL_MEMORY from vkAllocateDescriptorSets is the pool's own bookkeeping rather than a
+// leak - every set a reset invalidates is dropped from the map too, so nothing later binds a set that no longer exists.
+VkDescriptorSet dispatch_set(Device& d, Pipeline& p, std::map<std::string, VkDescriptorSet>* sets) {
     if (p.pool == VK_NULL_HANDLE || p.dsl == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    if (sets != nullptr) {
+        auto it = sets->find(p.key);
+        if (it != sets->end()) return it->second;
+    }
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = p.pool;
     ai.descriptorSetCount = 1;
@@ -1408,17 +1425,31 @@ VkDescriptorSet chain_set(Chain& c, Pipeline& p, Device& d) {
     VkResult r = vkAllocateDescriptorSets(d.dev, &ai, &set);
     if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) {
         vkResetDescriptorPool(d.dev, p.pool, 0);
+        if (sets != nullptr) sets->clear();
         r = vkAllocateDescriptorSets(d.dev, &ai, &set);
     }
     if (r != VK_SUCCESS) { note("descsets", "vkAllocateDescriptorSets for %s said %s\n", p.name.c_str(), vk_name(r)); return VK_NULL_HANDLE; }
-    c.sets[p.key] = set;
+    if (sets != nullptr) (*sets)[p.key] = set;
     return set;
 }
 
+VkDescriptorSet chain_set(Chain& c, Pipeline& p, Device& d) { return dispatch_set(d, p, &c.sets); }
+
 // Record one dispatch.  A SPIR-V entry point takes its arguments as ONE parameter block, so it goes in as push
-// constants when it fits (maxPushConstantSize is 64 B on both Arcs, P1) and as a uniform binding otherwise; each
-// uint64 the caller declares a device address becomes one storage binding over that address's own span, with the
-// offset taken from the span (which may be past 4 GiB) and the range clamped by bind_span (which may not be).
+// constants when it fits maxPushConstantsSize (256 B on both Arcs - the self-check dump prints the number; an earlier
+// note on this function said 64 B, which is not what these cards report) and as one uniform binding when it does not
+// (the STRATA_VULKAN_UNIFORM_PARAMS=1 route; register_pipeline refuses a wider block by name otherwise).
+//
+// Those parameter bytes are ONE input of the dispatch, not the whole contract.  The storage bindings are the other one,
+// and they are written from the same blob on BOTH routes: every uint64 the caller declares a device address
+// (`storage_bindings` of them, in argument order) becomes one storage-buffer binding over that address's own span, with
+// the offset taken from the span (which may be past 4 GiB) and the range clamped by bind_span (which may not be).  The
+// first version of this function built those bindings only inside the uniform-parameter branch, so the push-constant
+// route - which is every kernel whose parameter block fits 256 B, and that is what a CUDA kernel's handful of pointers
+// and scalars always is - dispatched with no descriptor set bound at all: the pipeline layout HAD the set layout, the
+// shader read its buffers, and nothing had written them.  The noop pipeline registered in open_device is param_bytes 8
+// with one storage binding and is never dispatched, which is why Phase 1 never met that hole.  The argument contract
+// VULKAN-BACKEND-PLAN.md states is both at once, and that is what this function now does.
 // `x` is the graph exec being re-encoded: its buffer and its window block are then the target, which is how a replay
 // re-uploads the parameter bytes instead of reusing the constants baked in at capture.
 Error record_dispatch(Device& d, StreamImpl* s, Pipeline& p, const LaunchConfig& cfg, const void* args, size_t args_bytes,
@@ -1435,12 +1466,25 @@ Error record_dispatch(Device& d, StreamImpl* s, Pipeline& p, const LaunchConfig&
     else if (s->rec != nullptr) { pa = &s->rec->param_alloc; pu = &s->rec->param_used; }
     else if (ch != nullptr) { pa = &ch->param_alloc; pu = &ch->param_used; }
 
+    // The descriptor set is the chain slot's or the replay's, keyed by pipeline, from the pipeline's own pool.
+    std::map<std::string, VkDescriptorSet>* sets = nullptr;
+    if (x != nullptr) sets = &x->sets;
+    else if (ch != nullptr) sets = &ch->sets;
+
+    const bool uniform_params = (p.param_bytes != 0 && !p.push_params);
+
     if (p.push_params && p.param_bytes != 0) {
         uint8_t block[256];
         std::memset(block, 0, sizeof block);
         if (args && args_bytes) std::memcpy(block, args, std::min<size_t>(args_bytes, sizeof block));
         vkCmdPushConstants(cb, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, p.param_bytes, block);
-    } else if (p.param_bytes != 0 && pa != nullptr && pu != nullptr) {
+    }
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    std::vector<VkDescriptorBufferInfo> infos;
+    std::vector<VkWriteDescriptorSet> writes;
+
+    if (uniform_params && pa != nullptr && pu != nullptr) {   // the parameter block as a uniform binding, plus the storage bindings
         if (*pa == nullptr) {
             bool oom = false;
             *pa = sub_alloc(d, 64 * kKiB, kHostWant, d.align_uniform, &oom);
@@ -1454,31 +1498,8 @@ Error record_dispatch(Device& d, StreamImpl* s, Pipeline& p, const LaunchConfig&
         if (args && args_bytes) std::memcpy(cpu + off, args, std::min<size_t>(args_bytes, (size_t) p.param_bytes));
         *pu = off + p.param_bytes;
 
-        std::map<std::string, VkDescriptorSet>* sets = nullptr;
-        if (x != nullptr) sets = &x->sets;
-        else if (ch != nullptr) sets = &ch->sets;
-        VkDescriptorSet set = VK_NULL_HANDLE;
-        {   // the descriptor set for this (pipeline, target) pair, allocated from the pipeline's own pool
-            auto it = sets->find(p.key);
-            if (it != sets->end()) set = it->second;
-            else if (p.pool != VK_NULL_HANDLE && p.dsl != VK_NULL_HANDLE) {
-                VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-                ai.descriptorPool = p.pool;
-                ai.descriptorSetCount = 1;
-                ai.pSetLayouts = &p.dsl;
-                VkResult r = vkAllocateDescriptorSets(d.dev, &ai, &set);
-                if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) {
-                    vkResetDescriptorPool(d.dev, p.pool, 0);
-                    sets->clear();
-                    r = vkAllocateDescriptorSets(d.dev, &ai, &set);
-                }
-                if (r != VK_SUCCESS) { note("descsets", "vkAllocateDescriptorSets for %s said %s\n", p.name.c_str(), vk_name(r)); return fail(kErrorInvalidValue); }
-                (*sets)[p.key] = set;
-            }
-        }
+        set = dispatch_set(d, p, sets);
         if (set == VK_NULL_HANDLE) return fail(kErrorInvalidValue);
-        std::vector<VkDescriptorBufferInfo> infos;
-        std::vector<VkWriteDescriptorSet> writes;
         VkDescriptorBufferInfo ubi;
         bind_span(d, sp.block->buf, sp.block_off + off, p.param_bytes, ubi);
         infos.push_back(ubi);
@@ -1489,23 +1510,29 @@ Error record_dispatch(Device& d, StreamImpl* s, Pipeline& p, const LaunchConfig&
         w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         w.pBufferInfo = &infos.back();
         writes.push_back(w);
-        const uint64_t* words = (const uint64_t*) args;
-        for (uint32_t i = 0; i < p.storage_count; ++i) {
-            const uint64_t addr = (args && (size_t) (i * 8) < args_bytes) ? words[i] : 0;
-            uint64_t aoff = 0;
-            bool is_host = false;
-            Alloc* a = find_alloc(d, (const void*) (uintptr_t) addr, &aoff, &is_host);
-            const Span* sp2 = a != nullptr ? span_at(a, aoff) : nullptr;
-            VkDescriptorBufferInfo bi{VK_NULL_HANDLE, 0, 1};
-            if (sp2 != nullptr) {
-                const uint64_t inside = addr - sp2->addr;                 // the OFFSET may be past 4 GiB ...
-                bi.range = std::min<uint64_t>(sp2->bytes - inside, block_limit(d));   // ... the RANGE may not
-                bind_span(d, sp2->block->buf, sp2->block_off + inside, bi.range, bi); // ... and both are checked here
-            } else {
-                note("param-addr", "the kernel %s was given the device address %llu, which is not an allocation this "
-                                   "runtime handed out; its storage binding is left empty\n", p.name.c_str(),
-                     (unsigned long long) addr);
-            }
+    } else if (p.dsl != VK_NULL_HANDLE && p.storage_count != 0) {   // push constants (or no parameters at all) with storage bindings
+        set = dispatch_set(d, p, sets);
+        if (set == VK_NULL_HANDLE) return fail(kErrorInvalidValue);
+    }
+
+    const uint64_t* words = (const uint64_t*) args;
+    for (uint32_t i = 0; i < p.storage_count; ++i) {
+        const uint64_t addr = (args && (size_t) (i * 8) < args_bytes) ? words[i] : 0;
+        uint64_t aoff = 0;
+        bool is_host = false;
+        Alloc* a = find_alloc(d, (const void*) (uintptr_t) addr, &aoff, &is_host);
+        const Span* sp2 = a != nullptr ? span_at(a, aoff) : nullptr;
+        VkDescriptorBufferInfo bi{VK_NULL_HANDLE, 0, 1};
+        if (sp2 != nullptr) {
+            const uint64_t inside = addr - sp2->addr;                 // the OFFSET may be past 4 GiB ...
+            bi.range = std::min<uint64_t>(sp2->bytes - inside, block_limit(d));   // ... the RANGE may not
+            bind_span(d, sp2->block->buf, sp2->block_off + inside, bi.range, bi); // ... and both are checked here
+        } else {
+            note("param-addr", "the kernel %s was given the device address %llu, which is not an allocation this "
+                               "runtime handed out; its storage binding is left empty\n", p.name.c_str(),
+                 (unsigned long long) addr);
+        }
+        if (set != VK_NULL_HANDLE) {
             infos.push_back(bi);
             VkWriteDescriptorSet w2{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w2.dstSet = set;
@@ -1515,11 +1542,21 @@ Error record_dispatch(Device& d, StreamImpl* s, Pipeline& p, const LaunchConfig&
             w2.pBufferInfo = &infos.back();
             writes.push_back(w2);
         }
+        if (trace_dispatch())
+            std::fprintf(stderr, "strata vulkan: dispatch %s on %s: storage binding %u = buffer offset %llu MiB "
+                                 "(+ %llu B), range %llu MiB\n", p.name.c_str(), d.props.deviceName,
+                         p.param_binding + (p.push_params ? 0 : 1) + i, (unsigned long long) (bi.offset / kMiB),
+                         (unsigned long long) bi.offset, (unsigned long long) (bi.range / kMiB));
+    }
+
+    if (!writes.empty()) {
         vkUpdateDescriptorSets(d.dev, (uint32_t) writes.size(), writes.data(), 0, nullptr);
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0, nullptr);
     } else if (p.dsl != VK_NULL_HANDLE && ch != nullptr) {
-        VkDescriptorSet set = chain_set(*ch, p, d);
-        if (set != VK_NULL_HANDLE) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0, nullptr);
+        // A pipeline with a set layout and nothing to write into it (no parameter block, no storage bindings named):
+        // the chain slot's own set is bound so the shader's buffers at least refer to allocated descriptors.
+        VkDescriptorSet bound = chain_set(*ch, p, d);
+        if (bound != VK_NULL_HANDLE) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &bound, 0, nullptr);
     }
 
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
