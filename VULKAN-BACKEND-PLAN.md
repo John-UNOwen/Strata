@@ -133,10 +133,13 @@ One standalone program, `vulkan/probe/vk_caps_probe.cpp`, built with the Vulkan 
 process, prints a table, exits. Each test is bounded (a few seconds). The user runs it.
 
 - [ ] **P1. Devices and limits.** Both Arcs enumerate in one `VkInstance` (the UHD 770 is skipped). Print per card:
-  driver version, `maxMemoryAllocationSize`, `maxStorageBufferRange`, `maxBufferSize` (`VK_KHR_maintenance4`),
-  `maxMemoryAllocationSize`, `bufferDeviceAddressAlignment`, `minImportedHostPointerAlignment`
-  (`VK_EXT_external_memory_host`), the memory heaps and types (device-local, host-visible, host-coherent, host-cached)
-  with each heap's size, subgroup sizes, and the extensions in the mapping table above.
+  the driver name and id (`VK_KHR_driver_properties`), `maxStorageBufferRange`, `maxBufferSize` (`VK_KHR_maintenance4`),
+  `minStorageBufferOffsetAlignment` (`VkPhysicalDeviceLimits`), `bufferImageGranularity`, `nonCoherentAtomSize`,
+  `minImportedHostPointerAlignment` (`VK_EXT_external_memory_host`), the memory heaps and types (device-local,
+  host-visible, host-coherent, host-cached) with each heap's size, subgroup sizes, and the extensions in the mapping
+  table above. There is no `bufferDeviceAddressAlignment` to read; the buffer address limit that matters is
+  `maxStorageBufferRange`, which Vulkan 1.4's `shader64BitIndexing` feature lifts, so P2b measures the behaviour
+  instead of trusting the feature name.
   - Also print, per card, `VK_EXT_memory_budget` if present (budget and current usage per heap). The spill rule of this
     PC is about **dedicated** memory (`HANDOFF-WINDOWS-SYCL.md` section 1), and Vulkan host-visible buffers read as
     shared memory, so the probe needs a per-card dedicated number of its own. `VK_EXT_memory_budget` gives it from
@@ -278,6 +281,48 @@ entry points a working engine needed: its 248 stubs are the ones it did not.
 5. You run `start-vulkan-probe.bat` three times, with a full exit between runs. Seconds each, no model load, and I do
    not run it. I read the logs, write `bench/results/vulkan-caps-<date>.md`, and either tick Phase 0 here or stop the
    plan at the gate that failed and report which one.
+
+
+
+## Phase 0 result (2026-10-17): gate 0 conditional pass
+
+Built with the Vulkan SDK 1.4.363.0 route (installed with winget) and the Visual Studio 18 2026
+generator, run three times as three separate processes with the Khronos validation layer on, 5 GiB
+asked per card. Full numbers in `bench/results/vulkan-caps-2026-10-17.md`.
+
+| probe | A770 | B580 |
+|---|---|---|
+| P1 limits, heaps, mapping table | measured | measured |
+| P2 device pointer reach | pass | pass |
+| P2b ordinary binding past 4 GiB | pass | pass |
+| P3 one host allocation, both cards | pass | pass |
+| P4 window sized command buffer | measured | measured |
+| P5 host raised flag, shader polling | fail | fail |
+| P6 cooperative matrix, packed dot product | measured | measured |
+
+What changes in the plan because of the measurement:
+
+1. Both cards advertise `maxStorageBufferRange`, `maxBufferSize` and `maxMemoryAllocationSize` of
+   4095 MiB, and `VK_EXT_shader_64bit_indexing` is absent, so no feature lifts those limits here.
+   A binding must stay under 4095 MiB. An offset may sit anywhere, including past 4 GiB: a binding
+   at offset 4096 MiB with a 512 MiB range read and wrote correct tags on both cards.
+2. The device address path works, including 5056 MiB inside a 5120 MiB allocation, on both cards.
+   What faults is the *span* one dispatch touches through a pointer: 120 MiB spread is fine,
+   2496 MiB spread lost the device. Layout rule for the port: bindings under 4095 MiB, offsets
+   free, and no single dispatch reaching across more than a couple of hundred MiB through a pointer.
+3. The doorbell does not exist on this driver. A `coherent volatile` flag (decorations confirmed in
+   SPIR-V) that is visible before the submit is never observed by the polling shader while its own
+   dispatch runs, in all four host visible memory flavors and with both host write methods. The
+   parked kernel wait is out; the host signals by submitting work.
+4. Dispatch cost is not the worry: 2400 dispatches in one command buffer, 20 submits, 0.335 ms mean
+   on the A770 and 0.384 ms on the B580, 0.14 to 0.16 us per dispatch.
+5. P3 works as designed: one host allocation imported by both cards, correct reads in place and
+   correct writes seen by the host. Import needs `VkExternalMemoryBufferCreateInfo` on the buffer
+   and the memory type from `vkGetMemoryHostPointerPropertiesEXT`.
+
+Phase 1 starts with the compat header and the runtime, and its wait mechanism is a submit, not a
+flag. The open questions handed to the next agent are the exact span limit, whether it applies to
+reads as well as writes, and the doorbell replacement (timeline semaphore or a nudge submit).
 
 
 
