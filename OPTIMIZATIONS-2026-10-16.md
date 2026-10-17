@@ -32,9 +32,11 @@ Against VicGPT's bar and the old llama.cpp Vulkan model (two-card numbers now ga
 - **A 10k-token map chunk** reads in about 30-45 s at k22 (was 12-16 s at split11).
 
 **Arms for the k22 baseline**: `python bench/arms/make_arms_k22.py` writes the configs; `BENCH-ARMS.bat` (repo root)
-then runs the whole ladder automatically - each arm on its own fresh server and port (8191+), 3 runs each, pollution
-gate on every reply, summary table of all arms at the end (`tools/arms_summary.py`, newest run per arm, deltas vs
-k22ref). One arm alone: `bench/arms/run-arm.bat k22mirror6000`.
+then runs the whole ladder automatically - each arm in **3 separate fresh server sessions** (ports 8191+; 3 is the
+default, `set BENCH_REPEATS=5` to change), the suite with the pollution gate in every session, and a final
+session-level summary (`tools/arms_summary.py`): aggregates over clean sessions only, spread across sessions
+(consistency verdict per arm), deltas vs k22ref; `--newest 3` restricts to the latest round when re-runs pile onto
+old sessions, `--sessions` lists them all. One arm alone: `bench/arms/run-arm.bat k22mirror6000`.
 `k22ref`, `k22mirror6000`, `k22mirror10000`, `k22prefill16k`, `k22own4096`, `k22own4096mirror`, `k22ctx32k`, `k22ctx32kmirror`.
 The old split11-based arms (`make_arms.py`) stay for the frontier hunt itself.
 
