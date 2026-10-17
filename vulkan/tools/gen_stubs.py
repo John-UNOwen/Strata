@@ -20,7 +20,11 @@ body is `strata::vulkan_engine::missing("<qualified name>")` (vulkan/src/engine/
 non-zero.  A stub is a stop with a label, never a result.
 
 Entry points that already have a Vulkan implementation are defined by the runtime, so they are not unresolved and get
-no stub.  Regenerate - do not patch - from a fresh link log after any change to the host tree or after porting one:
+no stub.  The ones this port defines itself are named in IMPLEMENTED below: a link log is evidence about one build, and
+a log taken before a kernel was ported still names it, so the list is what keeps a regeneration from putting a stub back
+over a real body - a duplicate definition cl.exe would reject at the next link.  Add the name here in the same step as
+the file that implements it (and take the stub out of vulkan/src/engine/stubs.cpp).  Regenerate - do not patch - from a
+fresh link log after any change to the host tree or after porting one:
 
     python vulkan/tools/gen_stubs.py build-vulkan/logs/link.log vulkan/src/engine/stubs.cpp
 
@@ -52,6 +56,18 @@ REFERENCED_RE = re.compile(r'referenced in function "((?:[^"\\]|\\.)*)"\s+\((\?[
 HDR_DIRS = ["include/strata/kernels", "include/strata/prefill", "include/strata/core", "include/strata/platform",
             "include/strata/ngram", "include/strata/spec", "include/strata/program", "include/strata/qwen35",
             "include/strata/artifact", "include/strata/plan", "vulkan/include/strata/gpu"]
+
+# Entry points this port already IMPLEMENTS, keyed by the qualified name as undname spells it, valued by the file that
+# defines them.  A link log is evidence about one build: a log captured before a kernel was ported still names it, and a
+# stub written over the real body is a duplicate definition cl.exe refuses.  Porting one means adding its name here in
+# the same step as the file that answers it, and taking its stub out of vulkan/src/engine/stubs.cpp (or regenerating
+# that file from a link log that no longer reports the symbol).  add_inplace is the first entry on this list: it was
+# the first unresolved symbol this build ever reported, out of strata_vulkan_host.lib(expert_source.obj), and
+# vulkan/src/kernels/elementwise.cpp is what answers it now - which is why vulkan/probe/stub_probe.cpp calls
+# strata::kernels::scale_inplace instead: the probe's contract is to land inside a stub, and scale_inplace is still one.
+IMPLEMENTED = {
+    "strata::kernels::add_inplace": "vulkan/src/kernels/elementwise.cpp",
+}
 
 ACCESS = ("public:", "protected:", "private:")
 CC = ("__cdecl", "__thiscall", "__stdcall", "__fastcall", "__vectorcall")
@@ -426,6 +442,7 @@ def main():
 
     defs, unmatched, used = [], [], set()
     runtime_face = []                                       # unresolved names in strata::gpu:: - refused, not stubbed
+    implemented = []                                        # names on IMPLEMENTED - real body, no stub written
     histogram = {}
     for mangled, dem in zip(names, demangled):
         sig = parse_sig(dem)
@@ -436,6 +453,9 @@ def main():
         histogram[ns] = histogram.get(ns, 0) + 1
         if ns == "strata::gpu" or ns.startswith("strata::gpu::"):
             runtime_face.append((mangled, dem))
+            continue
+        if sig["qual"] in IMPLEMENTED:
+            implemented.append((sig["qual"], IMPLEMENTED[sig["qual"]], mangled, unresolved[mangled]))
             continue
         h, decl, is_member = declaring_header(sig, good, texts)
         if not h:
@@ -480,6 +500,12 @@ def main():
     for h in skipped:
         print("  HEADER-SKIPPED %s" % h)
     print("stubs written   : %d" % len(defs))
+    if implemented:
+        print("  IMPLEMENTED   : %d name(s) this port already defines; no stub written for them" % len(implemented))
+        for qual, where, mangled, info in implemented:
+            print("    %-56s %s" % (qual, where))
+            print("      %s for %s, reported by %s (%d mention(s)) - a body exists, so the stub does not"
+                  % (info["code"], mangled, info["obj"], info["mentions"]))
     for ns in sorted(histogram, key=lambda k: (-histogram[k], k)):
         print("  %-42s %d" % (ns, histogram[ns]))
     for m, d, why in unmatched:

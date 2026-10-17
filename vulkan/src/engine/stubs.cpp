@@ -129,12 +129,6 @@ bool strata::core::RemoteExpertOpt::reduce(strata::core::RemoteExperts & ,void c
 //   declared by include/strata/core/remote_expert_opt.hpp
 strata::core::RemoteExpertOpt::~RemoteExpertOpt() { strata::vulkan_engine::missing("strata::core::RemoteExpertOpt::~RemoteExpertOpt"); }
 
-// strata::kernels::add_inplace
-//   LNK2019: unresolved external symbol ?add_inplace@kernels@strata@@YAXPEAMPEBM_JPEAX@Z
-//   reported by strata_vulkan_host.lib(expert_source.obj) (1 mention(s))
-//   declared by include/strata/kernels/elementwise.hpp
-void strata::kernels::add_inplace(float * ,float const * ,__int64,void *) { strata::vulkan_engine::missing("strata::kernels::add_inplace"); }
-
 // strata::kernels::add_streams_broadcast
 //   LNK2019: unresolved external symbol ?add_streams_broadcast@kernels@strata@@YAXPEBM0PEAM_JHHPEAX@Z
 //   reported by strata_vulkan_host.lib(mtp.obj) (2 mention(s))
