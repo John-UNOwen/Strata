@@ -2,6 +2,8 @@
 REM BENCH-ARMS.bat [arm ...]  - run the whole k22 optimization ladder automatically.
 REM Each arm runs in 3 SEPARATE fresh engine server sessions (ports 8191, 8192, ...), so a sticky poison in one
 REM session shows up as a polluted/consistent split instead of hiding inside one session's tight 3 runs.
+REM THE LADDER STOPS AT THE FIRST POLLUTED SESSION (strata_bench exit 3): after a storm the engine state is not
+REM worth measuring; note the arm/session, restart the PC-side state and launch again when ready.
 REM Sessions per arm: set BENCH_REPEATS=5 (etc.) before calling to change it; default 3.
 REM Each session: fresh server, the built-in suite (3 runs each, warm-up pollution-scored), the pollution gate.
 REM Default ladder: k22ref k22mirror6000 k22own4096mirror k22prefill16k k22own4096 k22mirror10000 k22ctx32k k22ctx32kmirror
@@ -39,11 +41,19 @@ for %%a in (%ARMS%) do (
     echo.
     echo ============ arm %%a  session %%s of %REPEATS%  [port !PORT!] [fresh server, gate on ============
     python tools\strata_bench.py --config "bench\arms\%%a.json" --out "bench\results\arms\%%a" --port !PORT!
+    set RC=!errorlevel!
+    if "!RC!"=="3" (
+      echo pollution detected in arm %%a session %%s: this engine state is not worth measuring further - the ladder STOPS.
+      set "FAILED=!FAILED! %%a-%%s-polluted"
+      goto ladder_done
+    )
     if errorlevel 1 set "FAILED=!FAILED! %%a-%%s"
     REM let the engine release its VRAM fully before the next session loads
     timeout /t 25 /nobreak >nul
   )
 )
+
+:ladder_done
 
 echo.
 echo ================= ladder done: sessions per arm [clean/total] =================

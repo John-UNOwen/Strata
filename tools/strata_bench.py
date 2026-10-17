@@ -274,6 +274,7 @@ class Suite:
         self.tokens_per_word, self.overhead = 1.1, 40
         self.out: dict = {"chat": {}, "prompts": {}, "agent": {}, "clients": {}, "skipped": {}, "failures": [],
                           "pollution": []}
+        self.polluted_abort = False
 
     def tag(self, *parts) -> str:
         return "-".join([*map(str, parts), self.nonce])
@@ -287,14 +288,17 @@ class Suite:
             self.out["pollution"].append({"where": where, "run": d.get("run"), "max_run": d.get("reply_max_run"),
                                           "char_loop": d.get("reply_char_loop"), "word_loop": d.get("reply_word_loop"),
                                           "excerpt": d.get("pollution_excerpt")})
-            self.log(f"    POLLUTED REPLY at {where}: storm/loop signature. A poisoned session stays poisoned: "
-                     f"treat this session's numbers as void and re-run after a server restart.")
+            self.polluted_abort = True
+            self.log(f"    POLLUTED REPLY at {where}: storm/loop signature. The session is poisoned from here on; "
+                     f"the suite STOPS. Restart the server for the next measurement.")
 
     def calibrate(self):
         """Words that make a prompt of a wanted size: two tiny requests (200 and 800 words) give the tokens per word as a
         slope, so the template's fixed part does not skew it."""
         pts = []
         for words in (200, 800):
+            if self.polluted_abort:
+                return
             r = digest_junk(chat(self.base, self.key, [{"role": "user", "content": f"[{self.tag('cal', words)}]\n" + long_prompt(words)}], 1))
             self.check_pollution("calibration", r)
             pts.append(r.get("prompt_tokens"))
@@ -308,10 +312,14 @@ class Suite:
         return [{"role": "user", "content": f"[bench {self.tag(run, tokens, 'p')}]\n" + long_prompt(words)}]
 
     def warm_up(self):
-        self.log("warming up (not measured, but pollution-scored: a storm here voids the session) ...")
+        self.log("warming up (not measured, but pollution-scored: a storm here stops the session) ...")
         d = digest_junk(chat(self.base, self.key, [{"role": "user", "content": PROMPTS[0]}], 24, self.think))
         self.check_pollution("warmup chat", d)
+        if self.polluted_abort:
+            return
         self.calibrate()
+        if self.polluted_abort:
+            return
         d = digest_junk(chat(self.base, self.key, self.prompt_for(1024, -1), 8, self.think))
         self.check_pollution("warmup 1K prompt", d)
 
@@ -325,6 +333,10 @@ class Suite:
                 d.update(run=run, prompt=i)
                 rows.append(d)
                 self.check_pollution(f"chat run {run + 1} q{i + 1}", d)
+                if self.polluted_abort:
+                    break
+            if self.polluted_abort:
+                break
                 if not d["ok"]:
                     self.fail("chat", d)
                 else:
@@ -347,6 +359,8 @@ class Suite:
             d["run"] = run
             rows.append(d)
             self.check_pollution(f"{label} run {run + 1}", d)
+            if self.polluted_abort:
+                break
             if not d["ok"]:
                 self.fail(label, d)
             else:
@@ -392,6 +406,8 @@ class Suite:
             self.check_pollution(f"agent run {run + 1} turn {t}", d)
             if not d["ok"]:
                 self.fail("agent", d)
+                break
+            if self.polluted_abort:
                 break
             msgs.append({"role": "assistant", "content": r["text"] or "Understood."})
         return turns
@@ -459,14 +475,18 @@ class Suite:
 
     def run(self):
         self.warm_up()
-        self.run_chat()
-        self.run_prompt(4096, "4K")
-        self.run_prompt(16384, "16K")
-        self.run_agent()
+        steps = [("chat", self.run_chat), ("4K", lambda: self.run_prompt(4096, "4K")),
+                 ("16K", lambda: self.run_prompt(16384, "16K")), ("agent", self.run_agent)]
         if self.clients:
-            self.run_clients(self.clients)
+            steps.append(("clients", lambda: self.run_clients(self.clients)))
         if self.want_long:
-            self.run_prompt(32768, "32K")
+            steps.append(("32K", lambda: self.run_prompt(32768, "32K")))
+        for label, fn in steps:
+            if self.polluted_abort:
+                self.out["skipped"][label] = "pollution detected earlier in this session"
+                self.log(f"{label}: skipped ({self.out['skipped'][label]})")
+                continue
+            fn()
         return self.out
 
 
@@ -1091,6 +1111,8 @@ def main(argv=None) -> int:
         say(f"\nReport: {shown / 'README.md'}\nShare it: open a pull request that adds the folder {shown} (see docs/COMMUNITY_BENCHMARKS.md), "
             f"or paste README.md into a GitHub issue. Home folders, user and host names and IP addresses are already replaced; "
             f"read it once before you share it.")
+        if out.get("pollution"):
+            return 3
         return 1 if out["failures"] and not any(out[k] for k in ("chat", "prompts", "agent")) else 0
     finally:
         if started:

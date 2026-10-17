@@ -81,9 +81,11 @@ during the discarded warmup would have tainted every number invisibly. Tight ran
 are not evidence of cleanliness - a poisoned session is consistently fast.
 
 `tools/strata_bench.py` now carries a client-side **pollution gate**: every reply (warmup included) is scored for
-storm signatures (long single-character bursts) and degenerate loops; any hit voids the session's numbers, prints a
-POLLUTED banner and lists the flagged replies in the report. It needs no engine debug flags - whose synchronous scans
-can mask the fault (2/2 runs). Re-baseline every claim on the fixed engine with this gate: `run-arm.bat k22ref` first.
+storm signatures (long single-character bursts) and degenerate loops; any hit voids the session's numbers, STOPS the
+suite at that point (exit code 3; the rest of the tests are marked skipped), prints a POLLUTED banner and lists the
+flagged replies in the report; `BENCH-ARMS.bat` aborts the whole ladder on exit 3. It needs no engine debug flags -
+whose synchronous scans can mask the fault (2/2 runs). Re-baseline every claim on the fixed engine with this gate:
+`run-arm.bat k22ref` first.
 
 Historical baseline table (split11 era, `2ccc945`; pollution-unverified, kept only for shape):
 
