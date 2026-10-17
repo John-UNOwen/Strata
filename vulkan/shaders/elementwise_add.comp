@@ -1,0 +1,80 @@
+#version 450
+
+// vulkan/shaders/elementwise_add.comp - the first real engine kernel this port dispatches (Phase 2, the first entry
+// point in VULKAN-BACKEND-PLAN.md's Phase 2 item 1, "the residual / norm / elementwise kernels").
+//
+// It is `dst[i] += src[i]`, the body of strata::kernels::add_inplace (include/strata/kernels/elementwise.hpp:52),
+// which until this file existed was answered by a generated stub (vulkan/src/engine/stubs.cpp) that printed the name
+// and exited 3.  What it replaces, entry for entry, is src/kernels/cuda/elementwise.cu:57-60
+//   __global__ void add_kernel(float* __restrict__ dst, const float* __restrict__ src, long long n) {
+//       const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+//       if (i < n) dst[i] += src[i];
+//   }
+// launched at :158-163 with THREADS = 256 (the file's own constant) and grid_for(n) = (n + 255) / 256 (elementwise.cu:83).
+// gl_GlobalInvocationID.x IS blockIdx.x * blockDim.x + threadIdx.x: 256 invocations per workgroup below, and the
+// workgroup count the launcher passes as cfg.grid (vulkan/src/gpu/runtime.cpp:1526 vkCmdDispatch).
+//
+// THE PARAMETER BLOCK, and why it is 32 bytes in this order.  vulkan/src/gpu/runtime.cpp's record_dispatch copies the
+// caller's whole argument blob into push constants when it fits maxPushConstantsSize (256 B on both Arcs), so the push
+// block here is spelled member-for-member like the CUDA call's argument list - dst, src, n, stream - exactly as
+// vulkan/src/kernels/elementwise.cpp builds it.  GLSL's 64-bit scalars are `int64_t` and `uint64_t`, and glslc refuses
+// those names unless `GL_ARB_gpu_shader_int64` is required above (`long` and `ulong` are not GLSL at all: glslc stops at
+// the first one with "syntax error, unexpected IDENTIFIER"); with GL_EXT_scalar_block_layout they pack at 8-byte
+// alignment with no padding, which is the same layout the C++ side has:
+// 0, 8, 16, 24, 32 bytes total.  A 64-bit LITERAL in GLSL would need the `ul` suffix (`1ul`, `0ul`) - there is none
+// here, because the only value read out of this block is `n`, and it is compared against the index, not against a
+// constant.  The three address members are deliberately NOT read: on this runtime a device address reaches a shader
+// through a descriptor binding, not through a push constant (record_dispatch turns the first `storage_bindings` uint64
+// words of the blob into storage-buffer bindings, at each address's own offset inside its allocation, with the range
+// clamped to the card's 4095 MiB block limit and the offset free - Phase 0 P2b measured a correct 512 MiB binding at
+// offset 4096 MiB on both cards).  They stay in the block because the block IS the CUDA argument blob.
+//
+// WHAT THIS SHADER MUST NOT DO is the same rule vulkan/shaders/noop.comp states, and it is a measurement, not a style
+// preference: Phase 0 P5 (bench/results/vulkan-caps-2026-10-17.md) found that a `coherent volatile` flag written by
+// the host was never observed by a dispatch already running, in any of four host-visible flavours.  So there is no
+// poll, no spin, no counter, no loop here, and none will be added: a one-float-per-invocation map.  Host-to-GPU
+// ordering is the submit that carries this dispatch (strata::gpu::nudge_submit); GPU-to-host is the timeline value its
+// submit signals (strata::gpu::wait_timeline).
+//
+// Built by vulkan/CMakeLists.txt (shaders/elementwise_add.comp -> spv/engine_elementwise_add.spv via glslc ->
+// generated/vulkan_shaders/elementwise_add.h via tools/embed_spv.py), included by vulkan/src/kernels/elementwise.cpp,
+// registered there under the launch name "add_inplace" through strata::gpu::register_pipeline.
+
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+// The CUDA kernel's blockDim.x.  vulkan/src/gpu/runtime.cpp:1527-1530 reports a cfg.block that disagrees with this and
+// runs the SPIR-V's size anyway, so the value that decides the index stride is this line.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint64_t dst;     // byte 0  - the CUDA call's float* dst
+    uint64_t src;     // byte 8  - the CUDA call's const float* src
+    int64_t  n;       // byte 16 - the CUDA call's int64_t n: the only member this body reads
+    uint64_t stream;  // byte 24 - the CUDA call's void* stream (a VkQueue-carrying Stream here); not a shader input
+} pc;
+
+// binding 0 = dst, binding 1 = src, in CUDA argument order: record_dispatch binds them at
+// p.param_binding + (p.push_params ? 0 : 1) + i, and this pipeline's parameter block travels as push constants, so
+// p.param_binding is 0 and the storage bindings land at 0 and 1.  Both are runtime floats, one element per invocation.
+layout(set = 0, binding = 0) buffer Dst {
+    float d[];
+} dstbuf;
+
+layout(set = 0, binding = 1) buffer Src {
+    float s[];
+} srcbuf;
+
+void main() {
+    // The launch is 1-D (a CUDA <<<grid, 256>>>, a vkCmdDispatch of (grid, 1, 1)); the y/z guard is what keeps this
+    // body correct if a caller ever records it into a 2-D or 3-D grid instead of silently aliasing elements.
+    const uvec3 g = gl_GlobalInvocationID;
+    if (g.y != 0u || g.z != 0u) return;
+    const uint i = g.x;
+    // grid_for(n) rounds the workgroup count UP, so the last workgroup runs invocations with i >= n.  The guard is the
+    // CUDA body's `if (i < n)`, and it is not decoration: without it the tail workgroup writes past the end of both
+    // buffers.  The comparison is done in 64-bit to match pc.n rather than narrowing it.
+    if (int64_t(i) < pc.n) {
+        dstbuf.d[i] += srcbuf.s[i];
+    }
+}
