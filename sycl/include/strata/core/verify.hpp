@@ -135,6 +135,10 @@ public:
     /// request does not pay for them (a 2,400-node graph takes tens of ms to finalize on this backend).
     bool warm(std::string& err);
     bool commit(int n_keep, std::string& err);
+    /// STRATA_DBG_NAN_DEFER=1: count the non-finite logits of the window just run and find the first bad row.
+    /// Call it after commit(), where the window's queue work is already complete: that keeps the copy's sync out of the
+    /// window, which matters because a sync inside the window has hidden this fault in earlier runs.
+    int64_t scan_head_nonfinite(int64_t pos, int T, int& bad_row, int& bad_token);
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //

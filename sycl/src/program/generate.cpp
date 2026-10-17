@@ -11515,6 +11515,27 @@ int main(int argc, char **argv) try {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                // STRATA_DBG_WINDOW=1: one line per verify window, host counters only - no device work and no sync, so
+                // the timing inside the window is untouched. This is the trace that turns "a session stormed" into
+                // "window N of this request was fully accepted, then the next window produced junk".
+                if (static const bool dbg_win = std::getenv("STRATA_DBG_WINDOW") != nullptr; dbg_win) {
+                    const bool full = a == T - 1 && a >= 8;
+                    std::fprintf(stderr, "strata window: %lld T=%d accepted=%d pos=%lld%s%s\n",
+                                 (long long) ver.windows, T, a, (long long) p, full ? " FULL-WINDOW" : "",
+                                 from_sfx ? " (suffix draft)" : "");
+                }
+                // STRATA_DBG_NAN_DEFER=1: the head logits of the window just committed, scanned after the commit
+                // instead of inside the window. The sync of the copy therefore lands in the gap between windows, which
+                // is where the engine already waits; the sync inside the window is what hid this fault in 2 of 2 runs.
+                if (static const bool dbg_def = std::getenv("STRATA_DBG_NAN_DEFER") != nullptr; dbg_def) {
+                    int bad_row = -1, bad_token = -1;
+                    const int64_t bad = ver.scan_head_nonfinite(p, T, bad_row, bad_token);
+                    if (bad > 0)
+                        std::fprintf(stderr, "strata dbg: verify window %lld at position %lld: %lld non-finite logits, first "
+                                             "at row %d (its token %d)%s\n",
+                                     (long long) ver.windows, (long long) p, (long long) bad, bad_row, bad_token,
+                                     a == T - 1 ? ", FULLY ACCEPTED window" : "");
+                }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;

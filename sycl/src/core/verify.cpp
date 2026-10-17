@@ -2486,6 +2486,40 @@ void Verifier::forward_handoff() const {
         std::memcpy(hand_copy_, hand_out_, hand_copy_bytes_);
 }
 
+int64_t Verifier::scan_head_nonfinite(int64_t pos, int T, int& bad_row, int& bad_token) {
+    // The window's head logits are still the ones this stage wrote (the next window has not run yet), so this can be
+    // called right after commit(). One copy and one sync, in the gap between windows: no device work is reordered and
+    // nothing inside the window changes, which is the whole point (STRATA_DBG_NAN's in-window scan hid the fault).
+    bad_row = -1;
+    bad_token = -1;
+    if (head_logits_ == nullptr || n_vocab_ <= 0 || T <= 0) return 0;
+    std::vector<float> h((size_t) T * (size_t) n_vocab_);
+    try {
+        dpct::get_in_order_queue().memcpy(h.data(), head_logits_, h.size() * sizeof(float)).wait();
+    } catch (sycl::exception const& e) {
+        std::fprintf(stderr, "strata dbg: head scan at %lld failed: %s\n", (long long) pos, e.what());
+        return 0;
+    }
+    int64_t bad = 0;
+    for (int t = 0; t < T; ++t) {
+        const float* row = h.data() + (size_t) t * (size_t) n_vocab_;
+        int64_t n = 0;
+        for (int64_t v = 0; v < n_vocab_; ++v) n += !std::isfinite(row[(size_t) v]);
+        if (n > 0) {
+            bad += n;
+            if (bad_row < 0) {   // the first bad row, with the token its argmax picks (NaN compares false, as in the sampler)
+                bad_row = t;
+                int32_t best = 0;
+                float bv = row[0];
+                for (int64_t v = 1; v < n_vocab_; ++v)
+                    if (row[(size_t) v] > bv) { bv = row[(size_t) v]; best = (int32_t) v; }
+                bad_token = best;
+            }
+        }
+    }
+    return bad;
+}
+
 void Verifier::set_plan_slot(int grp) {
     const int64_t cap = sink_.cap;
     int32_t* base = h_plan_ + (size_t) grp * (size_t) plan_i32_;
