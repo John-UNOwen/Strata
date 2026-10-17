@@ -93,3 +93,8 @@ The config JSONs next to the launchers carry the engine env. The pieces the two-
 `STRATA_DBG_NAN=1` (state scans, window-head scan, commit-row scan, hand-off row scans), `STRATA_DBG_ALLOC=1`
 (device allocation map at prompt end). On this PC a single clean run proves nothing: gate every conclusion behind
 N>=3 identical runs.
+
+The serve log carries its own pollution signature, independent of the reply text: a junk reply accepts every suffix
+draft (`drafts accepted 48 of 48`) and runs about 1.3-2x the session's normal decode speed, because the model is
+emitting one repeated token. `python tools/arms_logscan.py` reads those `strata serve: prompt ...` lines and prints
+the suspicious rows per session; it flagged all five known-storm sessions and none of the nine clean ones.

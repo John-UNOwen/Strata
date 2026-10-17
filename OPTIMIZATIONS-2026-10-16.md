@@ -81,11 +81,18 @@ aggregating to **decode 22.2 (5% spread), 4K 377 (2%), 16K 628 (4%) - consistent
 - **k22 64K auto is ~75% clean, not immune**: the 4th session (21:06) stormed at the last short-chat request and the
   new stop cut the session there before the prompt tests. Storm-rate so far: 32K context 1/1, 16384-chunks 1/1
   (both lit inside the first two chat runs), 64K auto 1/4 (lit late in chat).
-- Every storm so far lit **inside the short-chat phase** (43-51 token prompts, 100-token decodes): mid-decode verify
-  windows, exactly the original fault signature. Short chats are the fuse; the bigger prompt shapes mostly inherit the
-  session state after ignition.
-- Deltas against the certified baseline (clean sessions only): mirrors neutral (within 4%); `own4096` holds its
-  trade (-27% decode, +32% 4K, +12% 16K) and ran clean 1/1 (small sample; needs its own 3-session round).
+- **Short chat is the usual fuse, not the only one**: `own4096`'s 3-session round (21:32-21:45) added a storm in the
+  **agent phase** (run 1 turn 4, the 11498-token turn that reuses 8577 tokens). That session's chat and prompt numbers
+  stayed valid (the fault does not reach backwards); `tools/arms_summary.py` now voids a session from the polluted
+  suite onwards instead of dropping the whole session.
+- **The engine log carries the same signature, independently of the reply text**: the junk replies accept every
+  suffix draft (`drafts accepted 29 of 29`, `48 of 48`, `30 of 30`) and run 1.3-2x the session's normal pace
+  (30.1 tok/s where the session ran 17.9; 36 tok/s where it ran 15.7). `tools/arms_logscan.py` reads the
+  `strata serve: prompt ...` lines and flags the same 5 storm sessions the client gate flagged, with no false hit in
+  the 9 clean ones. This is the second opinion to use on any log whose results.json predates the gate.
+- Deltas against the certified baseline (clean suites): mirrors neutral (within 4%); `own4096` is settled after
+  4 sessions (one polluted in the agent phase, chat/prompts valid): **decode 16.1 (7% spread), 4K 494.5 (4%),
+  16K 698.1 (6%) - consistent**, i.e. -27% decode for +31% 4K and +11% 16K.
 
 **These morning numbers are pollution-unverified and now treated as suspect.** They were benched 06:2x-07:42 on the
 engine *before* the scratch-race fix (`9953a5b`, ~09:45), i.e. the version that provably NaN'd split11-class runs in

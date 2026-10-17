@@ -420,6 +420,8 @@ class Suite:
         self.log(f"agent: a session of {AGENT_TURNS + 1} turns with four tools, x {self.runs} runs")
         sessions = []
         for run in range(self.runs):
+            if self.polluted_abort:
+                break
             turns = self.agent_session(run)
             sessions.append(turns)
             for d in turns:
