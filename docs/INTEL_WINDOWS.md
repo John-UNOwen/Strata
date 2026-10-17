@@ -83,9 +83,12 @@ The config JSONs next to the launchers carry the engine env. The pieces the two-
   and ran faster on the A770. On the two-card split the MTP path also carries an unresolved NaN hunt documented in
   `bench/results/handoff-mtp-k22-2026-10-16.md`. The built-in drafts (`--spec 4`) are stable and accepted 29-86% of
   drafts depending on the prompt.
-- **Cross-context memory on Windows is strict**: each Arc is its own SYCL platform; a kernel may not read another
-  context's buffers in place. The engine stages across cards through host memory (per-card hand-off buffers,
-  per-queue gemm scratch); don't point two cards at one shared buffer in your own experiments.
+- **Cross-context memory on Windows is strict**: each Arc is its own SYCL platform, and the runtime refuses a context
+  spanning two platforms (`sycl::context{b580, a770}` throws "Can't add devices across platforms"), so the engine must
+  keep one context per card. A kernel may not read the other context's buffers in place (it returns wrong data with no
+  error); staging through host memory works. That is why cross-card hand-offs cost a PCIe round trip, and why one card
+  cannot help the other's prompt read without the same staging. On Linux both cards share one platform, one context
+  holds both, and the engine keeps in-place hand-offs.
 - Windows engine logs go to the file named by the config's `"log"` field.
 
 ## Debug instruments (for the open items above)
