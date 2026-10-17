@@ -381,6 +381,16 @@ at 256 B, so a kernel with a wider parameter block needs `STRATA_VULKAN_UNIFORM_
 buffer path, refused by default) rather than a wider push block. The 4095 MiB binding clamp is per
 binding, so a tensor bigger than that needs several allocations, not one.
 
+The CUDA tree's doorbell is a dispatched kernel that polls a flag: `doorbell_wait_kernel(const volatile
+uint32_t* flag, const volatile uint32_t* seq)` in `src/kernels/cuda/elementwise.cu:217`, declared in
+`include/strata/kernels/elementwise.hpp:93-99` as "THE DOORBELL ... A KERNEL and not cudaEventRecord",
+with `__nanosleep` pacing at `include/strata/kernels/dp4a.hpp:45`. That is the exact mechanism Phase 0 P5
+measured as never visible on this driver, so `doorbell_wait` does not port as written: the ordering it
+provides has to come from a submit dependency or a timeline semaphore value. `doorbell_publish`,
+`doorbell_publish_res` and `doorbell_publish_value` are ordinary copy-and-increment kernels and do port.
+Of the 280 entry points the Vulkan link currently stubs, 224 are `strata::kernels::*`, 37
+`strata::prefill::*`, 7 `strata::prefill::Gemm::*` and 12 `strata::core::RemoteExpertOpt` methods.
+
 
 ## Rough sizes (for planning, not commitments)
 
