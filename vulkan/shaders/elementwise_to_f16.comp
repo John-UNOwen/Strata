@@ -1,0 +1,59 @@
+#version 450
+
+// vulkan/shaders/elementwise_to_f16.comp - strata::kernels::f32_to_f16_bulk: f32 to fp16 BITS.
+// The conversion is transcribed from include/strata/kernels/f16_bits.hpp:37-69, including the two cases that
+// that file's own comment says must not be conflated: an f32 inf/NaN (raw exponent 255) stays an inf/NaN, and a
+// FINITE value too large for fp16 saturates to +inf rather than becoming a NaN (a numpy oracle caught the
+// conflated version of that test in the CUDA tree).  Subnormals keep their rounding path.
+//
+// GLSL has no float-to-bits reinterpret, so the source is bound as uints and read as words; nothing here needs the
+// float view of it.  Output is uint words holding two 16-bit values, so one invocation writes one whole word and no
+// two invocations ever touch the same word (which a read-modify-write per element would).
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint64_t x;
+    uint64_t y;
+    int64_t  n;
+    uint64_t stream;
+} pc;
+
+layout(set = 0, binding = 0) buffer Xu { uint w[]; } xu;
+layout(set = 0, binding = 1) buffer Y { uint w[]; } yb;
+
+uint f16_bits(uint x) {
+    const uint sign = (x >> 16) & 0x8000u;
+    const uint rawexp = (x >> 23) & 0xFFu;
+    const int exp = int(rawexp) - 127 + 15;
+    uint man = x & 0x7FFFFFu;
+    if (rawexp == 0xFFu) return sign | 0x7C00u | (man != 0u ? 0x200u : 0u);   // inf, or a quieted NaN
+    if (exp >= 31) return sign | 0x7C00u;                                    // finite overflow saturates to inf
+    if (exp <= 0) {
+        if (exp < -10) return sign;                                          // underflow to a signed zero
+        man |= 0x800000u;                                                    // restore the implicit leading 1
+        const uint sh = uint(14 - exp);
+        uint h = (man >> sh) & 0x3FFu;
+        const uint rem = man & ((1u << sh) - 1u);
+        if (rem > (1u << (sh - 1u)) || (rem == (1u << (sh - 1u)) && (h & 1u) != 0u)) ++h;
+        return sign | h;
+    }
+    uint h = sign | (uint(exp) << 10) | (man >> 13);
+    const uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) ++h;             // the carry may bump the exponent
+    return h;
+}
+
+void main() {
+    const uvec3 g = gl_GlobalInvocationID;
+    if (g.y != 0u || g.z != 0u) return;
+    const int j = int(g.x);
+    const int i0 = j * 2;
+    if (int64_t(i0) >= pc.n) return;
+    const uint lo = f16_bits(xu.w[i0]);
+    const int i1 = i0 + 1;
+    if (int64_t(i1) < pc.n) yb.w[j] = (f16_bits(xu.w[i1]) << 16) | lo;
+    else yb.w[j] = (yb.w[j] & 0xFFFF0000u) | lo;   // odd n: the other half of the last word is not ours to write
+}

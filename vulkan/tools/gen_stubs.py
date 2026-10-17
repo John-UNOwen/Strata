@@ -67,6 +67,14 @@ HDR_DIRS = ["include/strata/kernels", "include/strata/prefill", "include/strata/
 # strata::kernels::scale_inplace instead: the probe's contract is to land inside a stub, and scale_inplace is still one.
 IMPLEMENTED = {
     "strata::kernels::add_inplace": "vulkan/src/kernels/elementwise.cpp",
+    "strata::kernels::scale_inplace": "vulkan/src/kernels/elementwise.cpp",
+    "strata::kernels::silu_inplace": "vulkan/src/kernels/elementwise.cpp",
+    "strata::kernels::gdn_gate": "vulkan/src/kernels/elementwise.cpp",
+    "strata::kernels::rms_norm_weighted": "vulkan/src/kernels/elementwise.cpp",
+    "strata::kernels::embedding_gather": "vulkan/src/kernels/elementwise.cpp",
+    "strata::kernels::f32_to_f16_bulk": "vulkan/src/kernels/elementwise.cpp",
+    "strata::kernels::f32_to_bf16_bulk": "vulkan/src/kernels/elementwise.cpp",
+    "strata::kernels::dequant_bf16": "vulkan/src/kernels/dequant_bf16.cpp",
 }
 
 ACCESS = ("public:", "protected:", "private:")

@@ -1,0 +1,87 @@
+#version 450
+
+// vulkan/shaders/elementwise_dequant_bf16.comp - strata::kernels::dequant_bf16 for the Q8_0 block (ggml type 8):
+// 32 signed bytes and an FP16 scale, 34 bytes per block, value = d * (float) q.  One invocation per block, matching
+// the CUDA side's "one thread per 32-element group" (src/kernels/cuda/dequant_bf16.cu's geometry table gives Q8_0
+// 32 elements and 34 bytes).
+//
+// Two things here need bits rather than values, and GLSL has no reinterpret, so the shader does them the long way
+// on purpose:
+//   - the FP16 scale is read as two bytes and turned into a value arithmetically (mantissa * 2^exponent).  Every
+//     fp16 value is exact in f32, and inf and NaN are produced as inf and inf-minus-inf rather than as bit patterns.
+//   - the product has to be rounded to BF16, which needs its f32 bits.  So the product is written through the float
+//     view of a scratch buffer (binding 1) and read back through the uint view of the SAME allocation (binding 2)
+//     with a buffer memory barrier between, which gives bf16_bits the pattern the CUDA helper inspects.  A NaN scale
+//     therefore stays a NaN in BF16 instead of carrying out of the rounding add into -0 or +inf.
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint64_t blocks;
+    uint64_t scratch;
+    uint64_t scratch_bits;
+    uint64_t out_ptr;
+    int64_t  blocks_per_row;                            // cols / block_elems
+    int64_t  total_blocks;                              // rows * blocks_per_row
+    int64_t  block_first_byte;                          // (row0 * blocks_per_row) * block_bytes
+    int      block_bytes;                               // 34 for Q8_0
+    int      block_elems;                               // 32 for Q8_0
+    uint64_t stream;
+} pc;
+
+layout(set = 0, binding = 0) buffer Blocks { uint b[]; } bb;
+layout(set = 0, binding = 1) buffer ScratchF { float v[]; } sf;
+layout(set = 0, binding = 2) buffer ScratchU { uint w[]; } su;
+layout(set = 0, binding = 3) buffer Out { uint w[]; } yb;
+
+uint byte_at(uint base_byte, uint off) {
+    const uint at = base_byte + off;
+    return (bb.b[at >> 2u] >> (8u * (at & 3u))) & 0xFFu;
+}
+
+int int8_of(uint byte) { return int(byte) >= 128 ? int(byte) - 256 : int(byte); }
+
+// f16_bits.hpp's f32_from_f16, by value instead of by bits: exact for every finite fp16, and the special cases
+// produce an actual infinity and an actual NaN.
+float f16_to_f32(uint h) {
+    const bool neg = (h & 0x8000u) != 0u;
+    const uint ex = (h >> 10) & 0x1Fu;
+    const uint man = h & 0x3FFu;
+    if (ex == 31u) return man != 0u ? ((1.0 / 0.0) - (1.0 / 0.0)) : (neg ? -(1.0 / 0.0) : (1.0 / 0.0));
+    float mag;
+    if (ex == 0u) mag = float(man) * exp2(-24.0f);                          // subnormal: man * 2^-24
+    else mag = (1.0f + float(man) / 1024.0f) * exp2(float(int(ex) - 15));
+    return neg ? -mag : mag;
+}
+
+// bf16_bits.hpp:37-47, quieted NaN pass-through included.
+uint bf16_bits(uint i) {
+    if ((i & 0x7FFFFFFFu) > 0x7F800000u) return (i >> 16) | 64u;
+    i = (i + ((i >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u;
+    return i >> 16;
+}
+
+void main() {
+    const uvec3 g = gl_GlobalInvocationID;
+    if (g.y != 0u || g.z != 0u) return;
+    const int bi = int(g.x);
+    if (bi >= int(pc.total_blocks)) return;
+
+    const uint blk_byte = uint(pc.block_first_byte) + uint(bi) * uint(pc.block_bytes);
+    const uint scale = byte_at(blk_byte, 32u) | (byte_at(blk_byte, 33u) << 8u);
+    const float d = f16_to_f32(scale);
+
+    const int out_base = bi * pc.block_elems;            // element index of this block's first value
+    const int sbase = bi * pc.block_elems;               // its scratch slot
+
+    for (int t = 0; t < pc.block_elems; t += 2) {
+        sf.v[sbase + t] = d * float(int8_of(byte_at(blk_byte, uint(t))));
+        sf.v[sbase + t + 1] = d * float(int8_of(byte_at(blk_byte, uint(t + 1))));
+        memoryBarrierBuffer();                            // the uint view must see the float view's stores
+        const uint lo = bf16_bits(su.w[sbase + t]);
+        const uint hi = bf16_bits(su.w[sbase + t + 1]);
+        yb.w[(out_base + t) >> 1] = (hi << 16) | lo;     // block_elems is even, so these words are this block's
+    }
+}

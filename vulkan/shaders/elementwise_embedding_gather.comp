@@ -1,0 +1,49 @@
+#version 450
+
+// vulkan/shaders/elementwise_embedding_gather.comp - strata::kernels::embedding_gather.
+// CUDA body: src/kernels/cuda/elementwise.cu:19-32.  One element per invocation: pull `code_bits` bits out of
+// byte i/(8/code_bits) at position (i%(8/code_bits))*code_bits, add code_bias, multiply by the group's scale and
+// add the group's offset.  __fmul_rn / __fadd_rn are single rounded operations, which is what a SPIR-V multiply
+// and add are here (glslang does not fuse them into an fma).
+//
+// The codes buffer is bytes and GLSL has no byte array, so it is read as 32-bit words and the byte is extracted
+// (little endian, like x86 and like the host's uint8_t array).  `offsets` may be null in CUDA's contract, so the
+// host passes a flag and substitutes a live buffer for the binding rather than letting the shader index a null.
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint64_t codes;
+    uint64_t scales;
+    uint64_t offsets;
+    uint64_t out_ptr;
+    int64_t  n;
+    int      code_bits;
+    int      code_bias;
+    int      has_offsets;
+    int      group_elems;
+    uint64_t stream;
+} pc;
+
+layout(set = 0, binding = 0) buffer Codes { uint b[]; } cb;
+layout(set = 0, binding = 1) buffer Scales { float s[]; } sb;
+layout(set = 0, binding = 2) buffer Offsets { float o[]; } ob;
+layout(set = 0, binding = 3) buffer OutBuf { float v[]; } vb;
+
+void main() {
+    const uvec3 g = gl_GlobalInvocationID;
+    if (g.y != 0u || g.z != 0u) return;
+    const int i = int(g.x);
+    if (int64_t(i) >= pc.n) return;
+
+    const int per_byte = 8 / pc.code_bits;
+    const uint mask = (1u << uint(pc.code_bits)) - 1u;
+    const uint byte = (cb.b[i / per_byte] >> (8u * uint(i % per_byte))) & 0xFFu;
+    const uint code = (byte >> uint((i % per_byte) * pc.code_bits)) & mask;
+
+    const int group = i / pc.group_elems;
+    const float product = float(int(code) + pc.code_bias) * sb.s[group];
+    vb.v[i] = product + (pc.has_offsets != 0 ? ob.o[group] : 0.0f);
+}

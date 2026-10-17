@@ -1,0 +1,42 @@
+#version 450
+
+// vulkan/shaders/elementwise_gdn_gate.comp - strata::kernels::gdn_gate.
+// CUDA body: src/kernels/cuda/elementwise.cu:40-48, `gate[i] = softplus(alpha[i] + dt[h]) * ssm_a[h]` with
+// h = i % h_v, and softplus_dev at :38 is `x > 20 ? x : log1p(exp(x))`.  Both halves of that contract are what
+// src/kernels/elementwise_parity.cpp asserts: the large-x branch (exp overflows f32 above 88 and log1p has lost
+// precision long before that, so a gate that saturates to +inf reads as a state bug and not as a missing branch)
+// and the negative ssm_a (the state must decay).  log1p(exp(x)) is evaluated in double: closer to the numpy
+// reference than an f32 log1p, and it is the branch that decides whether the recurrence decays.
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint64_t alpha;
+    uint64_t dt;
+    uint64_t ssm_a;
+    uint64_t gate;
+    int64_t  n;                                      // n_tokens * h_v, the element count CUDA launches over
+    int64_t  h_v;
+    uint64_t stream;
+} pc;
+
+layout(set = 0, binding = 0) buffer Alpha { float a[]; } ab;
+layout(set = 0, binding = 1) buffer Dt { float d[]; } db;
+layout(set = 0, binding = 2) buffer SsmA { float s[]; } sb;
+layout(set = 0, binding = 3) buffer Gate { float g[]; } gb;
+
+float softplus(float x) {
+    if (x > 20.0f) return x;                                   // the large-x branch, not decoration
+    return log(1.0f + exp(x));              // f32: glslang has no double transcendental here, so log1p/exp are float
+}
+
+void main() {
+    const uvec3 gm = gl_GlobalInvocationID;
+    if (gm.y != 0u || gm.z != 0u) return;
+    const int i = int(gm.x);
+    if (int64_t(i) >= pc.n) return;
+    const int h = i % int(pc.h_v);
+    gb.g[i] = softplus(ab.a[i] + db.d[h]) * sb.s[h];
+}

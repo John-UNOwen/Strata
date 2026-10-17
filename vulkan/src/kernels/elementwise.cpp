@@ -52,6 +52,34 @@
 #    include "vulkan_shaders/elementwise_add.h"
 #    define STRATA_VULKAN_HAS_ADD_SPV 1
 #  endif
+#  if __has_include("vulkan_shaders/elementwise_scale.h")
+#    include "vulkan_shaders/elementwise_scale.h"
+#    define STRATA_VULKAN_HAS_SCALE_SPV 1
+#  endif
+#  if __has_include("vulkan_shaders/elementwise_silu.h")
+#    include "vulkan_shaders/elementwise_silu.h"
+#    define STRATA_VULKAN_HAS_SILU_SPV 1
+#  endif
+#  if __has_include("vulkan_shaders/elementwise_gdn_gate.h")
+#    include "vulkan_shaders/elementwise_gdn_gate.h"
+#    define STRATA_VULKAN_HAS_GDN_GATE_SPV 1
+#  endif
+#  if __has_include("vulkan_shaders/elementwise_rms_norm.h")
+#    include "vulkan_shaders/elementwise_rms_norm.h"
+#    define STRATA_VULKAN_HAS_RMS_NORM_SPV 1
+#  endif
+#  if __has_include("vulkan_shaders/elementwise_embedding_gather.h")
+#    include "vulkan_shaders/elementwise_embedding_gather.h"
+#    define STRATA_VULKAN_HAS_GATHER_SPV 1
+#  endif
+#  if __has_include("vulkan_shaders/elementwise_to_f16.h")
+#    include "vulkan_shaders/elementwise_to_f16.h"
+#    define STRATA_VULKAN_HAS_TO_F16_SPV 1
+#  endif
+#  if __has_include("vulkan_shaders/elementwise_to_bf16.h")
+#    include "vulkan_shaders/elementwise_to_bf16.h"
+#    define STRATA_VULKAN_HAS_TO_BF16_SPV 1
+#  endif
 #endif
 
 namespace strata::kernels {
@@ -153,6 +181,239 @@ void add_inplace(float* dst, const float* src, int64_t n, void* stream) {
             return;
         }
     }
+}
+
+// ---- the rest of the elementwise family ---------------------------------------------------------
+//
+// Each entry point below is the same four steps add_inplace is: register the pipeline once per process, build the
+// one parameter block the CUDA call's argument list becomes, launch grid_for(...) workgroups of the SPIR-V's own
+// size, and synchronise when the caller passed no stream (elementwise.cu:113-120).  The helpers are here so those
+// four steps are written once.  The argument structs are the part each kernel is its own about, and each one is the
+// mirror image of the push block in its .comp: field order IS storage-binding order, because record_dispatch binds
+// word i at binding p.param_binding + (p.push_params ? 0 : 1) + i.
+namespace {
+
+constexpr unsigned kNormThreads = 128;             // elementwise.cu:456 launches 4 warps (4 rows) to a block
+
+// vkCreateShaderModule wants whole 32-bit words and embed_spv.py emits bytes.  PipelineSpec.spv is read when the
+// pipeline is built and has to outlive the call, so the words are kept here for the life of the process.
+const std::vector<uint32_t>& intern_spv(const unsigned char* bytes, size_t len) {
+    static std::vector<std::vector<uint32_t>> kept;
+    kept.push_back(std::vector<uint32_t>((len + 3) / 4, 0u));
+    std::memcpy(kept.back().data(), bytes, len);
+    return kept.back();
+}
+
+// The SPIR-V for one shader, or a null pair when this build did not generate it.  A missing shader is then said out
+// loud by ensure_pipeline, at the call that needed it, rather than skipped.
+struct SpvBytes { const unsigned char* bytes; size_t len; };
+
+SpvBytes spv_for(const char* shader) {
+#ifdef STRATA_VULKAN_HAS_SCALE_SPV
+    if (std::strcmp(shader, "elementwise_scale") == 0) return {elementwise_scale_spv, elementwise_scale_spv_len};
+#endif
+#ifdef STRATA_VULKAN_HAS_SILU_SPV
+    if (std::strcmp(shader, "elementwise_silu") == 0) return {elementwise_silu_spv, elementwise_silu_spv_len};
+#endif
+#ifdef STRATA_VULKAN_HAS_GDN_GATE_SPV
+    if (std::strcmp(shader, "elementwise_gdn_gate") == 0) return {elementwise_gdn_gate_spv,
+                                                                   elementwise_gdn_gate_spv_len};
+#endif
+#ifdef STRATA_VULKAN_HAS_RMS_NORM_SPV
+    if (std::strcmp(shader, "elementwise_rms_norm") == 0) return {elementwise_rms_norm_spv,
+                                                                   elementwise_rms_norm_spv_len};
+#endif
+#ifdef STRATA_VULKAN_HAS_GATHER_SPV
+    if (std::strcmp(shader, "elementwise_embedding_gather") == 0) return {elementwise_embedding_gather_spv,
+                                                                          elementwise_embedding_gather_spv_len};
+#endif
+#ifdef STRATA_VULKAN_HAS_TO_F16_SPV
+    if (std::strcmp(shader, "elementwise_to_f16") == 0) return {elementwise_to_f16_spv,
+                                                                 elementwise_to_f16_spv_len};
+#endif
+#ifdef STRATA_VULKAN_HAS_TO_BF16_SPV
+    if (std::strcmp(shader, "elementwise_to_bf16") == 0) return {elementwise_to_bf16_spv,
+                                                                  elementwise_to_bf16_spv_len};
+#endif
+    return {nullptr, 0};
+}
+
+// Per entry point: 0 never tried, 1 registered, 2 refused.  A refusal is remembered instead of retried per call.
+bool ensure_pipeline(int& state, const char* launch_name, const char* shader, unsigned threads, size_t param_bytes,
+                     uint32_t storage_bindings) {
+    if (state == 1) return true;
+    if (state == 2) return false;
+    state = 2;
+    const SpvBytes spv = spv_for(shader);
+    if (spv.bytes == nullptr) {
+        std::fprintf(stderr, "strata vulkan: %s: no SPIR-V to register: generated/vulkan_shaders/%s.h was not built "
+                             "(vulkan/shaders/%s.comp is not in STRATA_VULKAN_SHADERS in vulkan/CMakeLists.txt, or "
+                             "glslc failed).  Nothing is dispatched and nothing is pretended.\n", launch_name, shader,
+                     shader);
+        return false;
+    }
+    const std::vector<uint32_t>& words = intern_spv(spv.bytes, spv.len);
+    gpu::PipelineSpec spec;
+    spec.name = launch_name;
+    spec.entry = "main";                                   // a GLSL .comp compiles its entry point to "main"
+    spec.spv = words.data();
+    spec.spv_words = words.size();
+    spec.workgroup = gpu::Dim3{threads, 1, 1};             // the SPIR-V's local_size_x,y,z
+    spec.shared_mem = 0;
+    spec.param_bytes = param_bytes;
+    spec.storage_bindings = storage_bindings;
+    const gpu::Error e = gpu::register_pipeline(spec);
+    if (e != gpu::kSuccess) {
+        std::fprintf(stderr, "strata vulkan: %s: register_pipeline(\"%s\") said %s (%s).  This entry point dispatches "
+                             "nothing.\n", launch_name, launch_name, gpu::error_name(e), gpu::error_string(e));
+        return false;
+    }
+    state = 1;
+    return true;
+}
+
+// CUDA's <<<grid, THREADS, 0, stream>>>: cfg.grid is the workgroup count, cfg.block the SPIR-V's local_size.
+gpu::Error dispatch(const char* name, unsigned grid, unsigned threads, const void* args, size_t args_bytes,
+                    void* stream) {
+    gpu::LaunchConfig cfg;
+    cfg.grid = gpu::Dim3{grid, 1, 1};
+    cfg.block = gpu::Dim3{threads, 1, 1};
+    cfg.shared_mem = 0;
+    cfg.stream = static_cast<gpu::Stream>(stream);         // nullptr is the device's legacy stream, as on CUDA
+    return gpu::launch_kernel(name, cfg, args, args_bytes);
+}
+
+// The launch's own error is printed, and a call with no stream synchronises before returning.  False means the
+// entry point wrote nothing at all, which is not a partial success.
+bool dispatched_ok(const char* name, const gpu::Error e, void* stream, int64_t n) {
+    if (e != gpu::kSuccess) {
+        std::fprintf(stderr, "strata vulkan: %s: launch_kernel over %lld elements said %s (%s).  Nothing was "
+                             "written.\n", name, (long long) n, gpu::error_name(e), gpu::error_string(e));
+        return false;
+    }
+    if (stream == nullptr) {
+        const gpu::Error s = gpu::device_synchronize();
+        if (s != gpu::kSuccess) {
+            std::fprintf(stderr, "strata vulkan: %s: device_synchronize after the launch said %s (%s).\n", name,
+                         gpu::error_name(s), gpu::error_string(s));
+            return false;
+        }
+    }
+    return true;
+}
+
+// A null buffer in the argument list is a caller bug.  CUDA would have faulted; here it is named and nothing runs.
+bool null_arg(const char* name, const void* p0, const void* p1, const void* p2, const void* p3) {
+    if (p0 != nullptr && p1 != nullptr && p2 != nullptr && p3 != nullptr) return false;
+    std::fprintf(stderr, "strata vulkan: %s: refused - a null buffer in its argument list (%p %p %p %p).  Nothing "
+                         "was written.\n", name, p0, p1, p2, p3);
+    return true;
+}
+
+// Each struct is its .comp's push block, field for field.  The asserts are the guard: a size that drifts changes
+// which word record_dispatch binds, and nothing would say so.
+struct ScaleArgs { uint64_t x; int64_t n; float s; uint32_t pad0; uint64_t stream; };
+struct SiluArgs { uint64_t x; int64_t n; uint64_t stream; };
+struct GateArgs { uint64_t alpha; uint64_t dt; uint64_t ssm_a; uint64_t gate; int64_t n; int64_t h_v; uint64_t stream; };
+struct NormArgs { uint64_t x; uint64_t w; int64_t rows; int64_t cols; float eps; uint32_t has_w; uint64_t stream; };
+struct GatherArgs { uint64_t codes; uint64_t scales; uint64_t offsets; uint64_t out; int64_t n;
+                    int32_t code_bits; int32_t code_bias; int32_t has_offsets; int32_t group_elems; uint64_t stream; };
+struct CvtArgs { uint64_t x; uint64_t y; int64_t n; uint64_t stream; };
+
+static_assert(sizeof(ScaleArgs) == 32, "ScaleArgs must match elementwise_scale.comp's push block");
+static_assert(sizeof(SiluArgs) == 24, "SiluArgs must match elementwise_silu.comp's push block");
+static_assert(sizeof(GateArgs) == 56, "GateArgs must match elementwise_gdn_gate.comp's push block");
+static_assert(sizeof(NormArgs) == 48, "NormArgs must match elementwise_rms_norm.comp's push block");
+static_assert(sizeof(GatherArgs) == 64, "GatherArgs must match elementwise_embedding_gather.comp's push block");
+static_assert(sizeof(CvtArgs) == 32, "CvtArgs must match elementwise_to_f16.comp and elementwise_to_bf16.comp");
+
+}  // namespace
+
+void scale_inplace(float* x, int64_t n, float s, void* stream) {
+    if (n <= 0) return;                                       // elementwise.cu:151
+    if (null_arg("scale_inplace", x, x, x, x)) return;
+    static int state = 0;
+    if (!ensure_pipeline(state, "scale_inplace", "elementwise_scale", kThreads, sizeof(ScaleArgs), 1)) return;
+    const ScaleArgs args{(uint64_t) (uintptr_t) x, (uint64_t) n, s, 0u, (uint64_t) (uintptr_t) stream};
+    if (!dispatched_ok("scale_inplace", dispatch("scale_inplace", grid_for(n), kThreads, &args, sizeof args, stream),
+                       stream, n)) return;
+}
+
+void silu_inplace(float* x, int64_t n, void* stream) {
+    if (n <= 0) return;                                       // elementwise.cu:179
+    if (null_arg("silu_inplace", x, x, x, x)) return;
+    static int state = 0;
+    if (!ensure_pipeline(state, "silu_inplace", "elementwise_silu", kThreads, sizeof(SiluArgs), 1)) return;
+    const SiluArgs args{(uint64_t) (uintptr_t) x, (uint64_t) n, (uint64_t) (uintptr_t) stream};
+    if (!dispatched_ok("silu_inplace", dispatch("silu_inplace", grid_for(n), kThreads, &args, sizeof args, stream),
+                       stream, n)) return;
+}
+
+void gdn_gate(const float* alpha, const float* dt, const float* ssm_a, float* gate, int64_t n_tokens, int64_t h_v,
+              void* stream) {
+    if (n_tokens <= 0 || h_v <= 0) return;                    // elementwise.cu:142
+    if (null_arg("gdn_gate", alpha, dt, ssm_a, gate)) return;
+    const int64_t n = n_tokens * h_v;
+    static int state = 0;
+    if (!ensure_pipeline(state, "gdn_gate", "elementwise_gdn_gate", kThreads, sizeof(GateArgs), 4)) return;
+    const GateArgs args{(uint64_t) (uintptr_t) alpha, (uint64_t) (uintptr_t) dt, (uint64_t) (uintptr_t) ssm_a,
+                        (uint64_t) (uintptr_t) gate, n, h_v, (uint64_t) (uintptr_t) stream};
+    if (!dispatched_ok("gdn_gate", dispatch("gdn_gate", grid_for(n), kThreads, &args, sizeof args, stream), stream,
+                       n)) return;
+}
+
+void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, float eps, void* stream) {
+    if (rows <= 0 || cols <= 0) return;                       // elementwise.cu:450
+    if (null_arg("rms_norm_weighted", x, x, x, x)) return;
+    static int state = 0;
+    if (!ensure_pipeline(state, "rms_norm_weighted", "elementwise_rms_norm", kNormThreads, sizeof(NormArgs), 2))
+        return;
+    // CUDA reads `w` only when it is non-null.  A null pointer cannot be a binding, so the slot is filled with x
+    // and the shader's has_w flag is what keeps it unread.
+    const NormArgs args{(uint64_t) (uintptr_t) x, (uint64_t) (uintptr_t) (w != nullptr ? w : x), rows, cols, eps,
+                        (uint32_t) (w != nullptr ? 1u : 0u), (uint64_t) (uintptr_t) stream};
+    const unsigned grid = (unsigned) ((rows + 3) / 4);        // four rows to a workgroup, as CUDA's 4 warps
+    if (!dispatched_ok("rms_norm_weighted", dispatch("rms_norm_weighted", grid, kNormThreads, &args, sizeof args,
+                                                     stream), stream, rows * cols)) return;
+}
+
+void embedding_gather(const uint8_t* codes, const float* scales, const float* offsets, int64_t n, int code_bits,
+                      int code_bias, int group_elems, float* out, void* stream) {
+    if (n <= 0) return;                                       // elementwise.cu:133
+    if (null_arg("embedding_gather", codes, scales, out, out)) return;
+    static int state = 0;
+    if (!ensure_pipeline(state, "embedding_gather", "elementwise_embedding_gather", kThreads, sizeof(GatherArgs), 4))
+        return;
+    // Same rule as the weight vector above: CUDA's contract allows a null `offsets`, and a null cannot be bound, so
+    // the slot holds scales and has_offsets is what keeps the shader off it.
+    const GatherArgs args{(uint64_t) (uintptr_t) codes, (uint64_t) (uintptr_t) scales,
+                          (uint64_t) (uintptr_t) (offsets != nullptr ? offsets : scales), (uint64_t) (uintptr_t) out,
+                          n, code_bits, code_bias, (offsets != nullptr ? 1 : 0), group_elems,
+                          (uint64_t) (uintptr_t) stream};
+    if (!dispatched_ok("embedding_gather", dispatch("embedding_gather", grid_for(n), kThreads, &args, sizeof args,
+                                                    stream), stream, n)) return;
+}
+
+void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
+    if (n <= 0) return;                                       // elementwise.cu:165
+    if (null_arg("f32_to_f16_bulk", x, y, x, x)) return;
+    static int state = 0;
+    if (!ensure_pipeline(state, "f32_to_f16_bulk", "elementwise_to_f16", kThreads, sizeof(CvtArgs), 2)) return;
+    const CvtArgs args{(uint64_t) (uintptr_t) x, (uint64_t) (uintptr_t) y, n, (uint64_t) (uintptr_t) stream};
+    const int64_t words = (n + 1) / 2;                        // one invocation writes one whole 32-bit output word
+    if (!dispatched_ok("f32_to_f16_bulk", dispatch("f32_to_f16_bulk", grid_for(words), kThreads, &args, sizeof args,
+                                                   stream), stream, n)) return;
+}
+
+void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
+    if (n <= 0) return;                                       // elementwise.cu:172
+    if (null_arg("f32_to_bf16_bulk", x, y, x, x)) return;
+    static int state = 0;
+    if (!ensure_pipeline(state, "f32_to_bf16_bulk", "elementwise_to_bf16", kThreads, sizeof(CvtArgs), 2)) return;
+    const CvtArgs args{(uint64_t) (uintptr_t) x, (uint64_t) (uintptr_t) y, n, (uint64_t) (uintptr_t) stream};
+    const int64_t words = (n + 1) / 2;
+    if (!dispatched_ok("f32_to_bf16_bulk", dispatch("f32_to_bf16_bulk", grid_for(words), kThreads, &args, sizeof args,
+                                                    stream), stream, n)) return;
 }
 
 }  // namespace strata::kernels

@@ -1,0 +1,27 @@
+#version 450
+
+// vulkan/shaders/elementwise_scale.comp - strata::kernels::scale_inplace: `x[i] *= s`.
+// CUDA body: src/kernels/cuda/elementwise.cu:50 (THREADS 256, guard `i < n`).
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint64_t x;
+    int64_t  n;
+    float    s;
+    uint     pad0;
+    uint64_t stream;
+} pc;
+
+layout(set = 0, binding = 0) buffer X {
+    float v[];
+} xb;
+
+void main() {
+    const uvec3 g = gl_GlobalInvocationID;
+    if (g.y != 0u || g.z != 0u) return;
+    const uint i = g.x;
+    if (int64_t(i) < pc.n) xb.v[i] *= pc.s;
+}

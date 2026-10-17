@@ -429,7 +429,9 @@ enable_language(C)
 #
 # It lives here, in the engine half, because it is the engine's: strata_gpu_vulkan add_dependencies() on it below, so
 # configuring it in the probe-only route would drag Phase 1's .comp files into the Phase 0 default build.
-set(STRATA_VULKAN_SHADERS noop elementwise_add)
+set(STRATA_VULKAN_SHADERS noop elementwise_add elementwise_scale elementwise_silu elementwise_gdn_gate
+    elementwise_rms_norm elementwise_embedding_gather elementwise_to_f16 elementwise_to_bf16
+    elementwise_dequant_bf16)
 file(MAKE_DIRECTORY ${GEN_DIR}/vulkan_shaders)
 set(ENGINE_SHADER_HEADERS "")
 foreach(name ${STRATA_VULKAN_SHADERS})
@@ -629,7 +631,7 @@ if(NOT STRATA_VULKAN_STUBS)
 endif()
 
 add_library(strata_gpu_vulkan STATIC src/gpu/runtime.cpp src/core/device_vk.cpp src/engine/missing.cpp
-                                     src/kernels/elementwise.cpp
+                                     src/kernels/elementwise.cpp src/kernels/dequant_bf16.cpp
                                      ${STRATA_VULKAN_STUB_SOURCES})
 target_include_directories(strata_gpu_vulkan BEFORE PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include/vulkan_compat   # FIRST: the CUDA runtime names, on Vulkan
@@ -799,6 +801,27 @@ else()
   target_compile_options(strata_vk_parity PRIVATE -Wall)
 endif()
 
+# strata_parity_elementwise: the repo's OWN elementwise driver, ../src/kernels/elementwise_parity.cpp, built against
+# this engine instead of a Vulkan-side test written for it.  That file is upstream's correctness contract for the
+# elementwise family: it asserts the softplus large-x branch, the negative ssm_a, silu's last-bit distance from the
+# numpy reference, the f16 round-to-nearest-even bits against kernels::f16_from_f32 element by element, the mean (not
+# the sum) in rms_norm and the rows=2 case with a null weight vector, embedding_gather's bit extraction with a code
+# bias, and it calls strata::kernels::dequant_bf16 last.  It is compiled unchanged and unlinked from
+# strata_vulkan_harness on purpose: that library already contains this file's main().
+add_executable(strata_parity_elementwise ../src/kernels/elementwise_parity.cpp)
+target_include_directories(strata_parity_elementwise PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/vulkan_compat
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${STRATA_ROOT}/include
+  ${S}/core
+  ${STRATA_ROOT}/third_party/ggml)
+target_link_libraries(strata_parity_elementwise PRIVATE strata_gpu_vulkan Vulkan::Vulkan)
+if(MSVC)
+  target_compile_options(strata_parity_elementwise PRIVATE /utf-8 /EHsc /W3 /FC)
+else()
+  target_compile_options(strata_parity_elementwise PRIVATE -Wall)
+endif()
+
 # STRATA_VULKAN_ENGINE=OFF: the targets are configured - they exist, `--target strata` still works - but they are out
 # of the default build.  That is what keeps start-vulkan-probe.bat (build-vulkan-probe, cached OFF, builds every
 # default target) building the probe and its shaders and nothing else, while the plain configure of this directory
@@ -808,7 +831,8 @@ if(NOT STRATA_VULKAN_ENGINE)
                  "engine's shader target are configured but EXCLUDE_FROM_ALL (the default build stays the Phase 0 "
                  "probe and its own shaders; --target strata still works in this build dir)")
   foreach(strata_engine_target IN ITEMS strata strata_gpu_vulkan strata_vulkan_host strata_vulkan_harness stub_probe
-                                        strata-device strata_vk_smoke strata_vk_parity vulkan_engine_shaders)
+                                        strata-device strata_vk_smoke strata_vk_parity strata_parity_elementwise
+                                         vulkan_engine_shaders)
     set_target_properties(${strata_engine_target} PROPERTIES EXCLUDE_FROM_ALL TRUE)
   endforeach()
 endif()

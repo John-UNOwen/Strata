@@ -1,0 +1,41 @@
+#version 450
+
+// vulkan/shaders/elementwise_to_bf16.comp - strata::kernels::f32_to_bf16_bulk: f32 to bf16 BITS.
+// Transcribed from include/strata/kernels/bf16_bits.hpp:37-47, including the pass-through that file insists on:
+// a NaN keeps its sign and top mantissa bits and gets the quiet bit set.  Without that line the rounding carry
+// turns 0x7FFFFFFF into -0 and 0x7F800001 into +inf, which masks a NaN that came from upstream.
+//
+// Same binding shape as elementwise_to_f16.comp: the source bound as uints (GLSL cannot reinterpret a float as
+// bits) and one output word per invocation so no two invocations share a word.
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint64_t x;
+    uint64_t y;
+    int64_t  n;
+    uint64_t stream;
+} pc;
+
+layout(set = 0, binding = 0) buffer Xu { uint w[]; } xu;
+layout(set = 0, binding = 1) buffer Y { uint w[]; } yb;
+
+uint bf16_bits(uint i) {
+    if ((i & 0x7FFFFFFFu) > 0x7F800000u) return (i >> 16) | 64u;   // quieted NaN, sign and top bits kept
+    i = (i + ((i >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u;            // round to nearest even
+    return i >> 16;
+}
+
+void main() {
+    const uvec3 g = gl_GlobalInvocationID;
+    if (g.y != 0u || g.z != 0u) return;
+    const int j = int(g.x);
+    const int i0 = j * 2;
+    if (int64_t(i0) >= pc.n) return;
+    const uint lo = bf16_bits(xu.w[i0]);
+    const int i1 = i0 + 1;
+    if (int64_t(i1) < pc.n) yb.w[j] = (bf16_bits(xu.w[i1]) << 16) | lo;
+    else yb.w[j] = (yb.w[j] & 0xFFFF0000u) | lo;
+}

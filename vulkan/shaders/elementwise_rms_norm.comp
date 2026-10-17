@@ -1,0 +1,52 @@
+#version 450
+
+// vulkan/shaders/elementwise_rms_norm.comp - strata::kernels::rms_norm_weighted.
+// CUDA body: src/kernels/cuda/elementwise.cu:88-111, launched 4 warps to a block (:450).  The same shape here:
+// a workgroup of 128 lanes is four 32-lane subgroups, one row each, and the row guard is load bearing - CUDA's
+// comment says the absence of that guard was the QSA bug (a rows=2 call ran eight warps and wrote two rows past
+// the end of the k cursor, straight over the v cursor).  Both Arcs report subgroupSize 32, so the 32-lane stride
+// over the columns is the same one the CUDA warp reduction uses.
+//
+// The reduction is a butterfly (subgroupShuffleXor at 16, 8, 4, 2, 1) where CUDA uses __shfl_down_sync.  Every
+// lane ends with the same total either way; the pairings differ, so the sum's last bit may differ.  The shared
+// driver compares with a relative tolerance, and the values that matter here are the MEAN of the squares and the
+// reciprocal that follows it, which both routes compute the same way.
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_ARB_gpu_shader_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint64_t x;
+    uint64_t w;
+    int64_t  rows;
+    int64_t  cols;
+    float    eps;
+    uint     has_w;
+    uint64_t stream;
+} pc;
+
+layout(set = 0, binding = 0) buffer X { float v[]; } xb;
+layout(set = 0, binding = 1) buffer W { float w[]; } wb;
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID.x;
+    const int row = int(gl_WorkGroupID.x) * 4 + int(gl_LocalInvocationID.x >> 5);
+    if (int64_t(row) >= pc.rows) return;                        // the guard the QSA bug was missing
+    const int base = row * int(pc.cols);                        // GLSL indexes with int, so this is the limit
+    const int cols = int(pc.cols);
+
+    float acc = 0.0f;
+    for (int c = int(lane); c < cols; c += 32) acc += xb.v[base + c] * xb.v[base + c];
+    for (uint off = 16u; off > 0u; off >>= 1u) acc += subgroupShuffleXor(acc, off);
+
+    // The mean, not the sum: ref/qsa.py::rms_norm divides by np.mean(np.square(x)).
+    const float inv = inversesqrt(acc / float(cols) + pc.eps);
+
+    for (int c = int(lane); c < cols; c += 32) {
+        const float v = (pc.has_w != 0u) ? xb.v[base + c] * wb.w[c] : xb.v[base + c];
+        xb.v[base + c] = v * inv;
+    }
+}

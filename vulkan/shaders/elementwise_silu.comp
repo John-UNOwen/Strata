@@ -1,0 +1,29 @@
+#version 450
+
+// vulkan/shaders/elementwise_silu.comp - strata::kernels::silu_inplace: `x[i] = x[i] / (1 + exp(-x[i]))`.
+// CUDA body: src/kernels/cuda/elementwise.cu:72-80 computes it in DOUBLE and casts back, because the numpy
+// reference in ref/gdn.py does, and the shared driver measures that last-bit difference rather than asserting
+// it away.  Same here: the value is widened to double, the divide and exp are double, the store is f32.
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint64_t x;
+    int64_t  n;
+    uint64_t stream;
+} pc;
+
+layout(set = 0, binding = 0) buffer X {
+    float v[];
+} xb;
+
+void main() {
+    const uvec3 g = gl_GlobalInvocationID;
+    if (g.y != 0u || g.z != 0u) return;
+    const uint i = g.x;
+    if (int64_t(i) >= pc.n) return;
+    const float v = xb.v[i];
+    xb.v[i] = v / (1.0f + exp(-v));         // f32: glslang has no double exp or log, so the CUDA double path
+}

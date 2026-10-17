@@ -339,23 +339,11 @@ void strata::kernels::doorbell_wait(unsigned int const * ,unsigned int const * ,
 //   declared by include/strata/kernels/iq_kernels.hpp
 bool strata::kernels::embed_type_supported(int) noexcept { strata::vulkan_engine::missing("strata::kernels::embed_type_supported"); return {}; }
 
-// strata::kernels::embedding_gather
-//   LNK2019: unresolved external symbol ?embedding_gather@kernels@strata@@YAXPEBEPEBM1_JHHHPEAMPEAX@Z
-//   reported by strata_vulkan_host.lib(layer.obj) (1 mention(s))
-//   declared by include/strata/kernels/elementwise.hpp
-void strata::kernels::embedding_gather(unsigned char const * ,float const * ,float const * ,__int64,int,int,int,float * ,void *) { strata::vulkan_engine::missing("strata::kernels::embedding_gather"); }
-
 // strata::kernels::embedding_gather_dev
 //   LNK2019: unresolved external symbol ?embedding_gather_dev@kernels@strata@@YAXPEBEPEBM1PEBHH_JHHH_K4PEAMPEAX@Z
 //   reported by strata_vulkan_host.lib(verify.obj) (3 mention(s))
 //   declared by include/strata/kernels/verify_kernels.hpp
 void strata::kernels::embedding_gather_dev(unsigned char const * ,float const * ,float const * ,int const * ,int,__int64,int,int,int,unsigned __int64,unsigned __int64,float * ,void *) { strata::vulkan_engine::missing("strata::kernels::embedding_gather_dev"); }
-
-// strata::kernels::f32_to_bf16_bulk
-//   LNK2019: unresolved external symbol ?f32_to_bf16_bulk@kernels@strata@@YAXPEBMPEAG_JPEAX@Z
-//   reported by strata_vulkan_host.lib(layer.obj) (3 mention(s))
-//   declared by include/strata/kernels/elementwise.hpp
-void strata::kernels::f32_to_bf16_bulk(float const * ,unsigned short * ,__int64,void *) { strata::vulkan_engine::missing("strata::kernels::f32_to_bf16_bulk"); }
 
 // strata::kernels::fetch_blobs
 //   LNK2019: unresolved external symbol ?fetch_blobs@kernels@strata@@YAXPEB_KPEBHPEAE_JHPEAX@Z
@@ -470,12 +458,6 @@ void strata::kernels::gdn_conv_l2_multi(float const * ,float const * ,float cons
 //   reported by strata_vulkan_host.lib(layer.obj) (1 mention(s))
 //   declared by include/strata/kernels/gdn.hpp
 void strata::kernels::gdn_conv_step(float * ,float const * ,float const * ,float * ,__int64,__int64,void *) { strata::vulkan_engine::missing("strata::kernels::gdn_conv_step"); }
-
-// strata::kernels::gdn_gate
-//   LNK2019: unresolved external symbol ?gdn_gate@kernels@strata@@YAXPEBM00PEAM_J2PEAX@Z
-//   reported by strata_vulkan_host.lib(layer.obj) (1 mention(s))
-//   declared by include/strata/kernels/elementwise.hpp
-void strata::kernels::gdn_gate(float const * ,float const * ,float const * ,float * ,__int64,__int64,void *) { strata::vulkan_engine::missing("strata::kernels::gdn_gate"); }
 
 // strata::kernels::gdn_l2_norm
 //   LNK2019: unresolved external symbol ?gdn_l2_norm@kernels@strata@@YAXPEAM_J1MPEAX@Z
@@ -1293,12 +1275,6 @@ void strata::kernels::rebase_ptrs(unsigned __int64 * ,int const * ,unsigned char
 //   declared by include/strata/kernels/verify_kernels.hpp
 void strata::kernels::resident_plan(int const * ,int,int,int const * ,int,unsigned char const * ,unsigned __int64 const * ,__int64,int * ,__int64,unsigned int * ,unsigned int,void * ,unsigned int *) { strata::vulkan_engine::missing("strata::kernels::resident_plan"); }
 
-// strata::kernels::rms_norm_weighted
-//   LNK2019: unresolved external symbol ?rms_norm_weighted@kernels@strata@@YAXPEAMPEBM_J2MPEAX@Z
-//   reported by strata_vulkan_host.lib(layer.obj) (2 mention(s))
-//   declared by include/strata/kernels/elementwise.hpp
-void strata::kernels::rms_norm_weighted(float * ,float const * ,__int64,__int64,float,void *) { strata::vulkan_engine::missing("strata::kernels::rms_norm_weighted"); }
-
 // strata::kernels::rope_neox_apply
 //   LNK2019: unresolved external symbol ?rope_neox_apply@kernels@strata@@YAXPEBMPEAM_JHH00PEBHPEAX@Z
 //   reported by strata_vulkan_host.lib(layer.obj) (3 mention(s))
@@ -1389,12 +1365,6 @@ void strata::kernels::sample_tokens(float const * ,int,int,int const * ,int,stra
 //   declared by include/strata/kernels/sampler.hpp
 bool strata::kernels::sample_tokens_spec(float const * ,int,int,int const * ,int,strata::kernels::SamplerParams const & ,int const * ,int const * ,int,int * ,void *) { strata::vulkan_engine::missing("strata::kernels::sample_tokens_spec"); return {}; }
 
-// strata::kernels::scale_inplace
-//   LNK2019: unresolved external symbol ?scale_inplace@kernels@strata@@YAXPEAM_JMPEAX@Z
-//   reported by strata_vulkan_host.lib(layer.obj) (1 mention(s))
-//   declared by include/strata/kernels/elementwise.hpp
-void strata::kernels::scale_inplace(float * ,__int64,float,void *) { strata::vulkan_engine::missing("strata::kernels::scale_inplace"); }
-
 // strata::kernels::scatter_rows_f32
 //   LNK2019: unresolved external symbol ?scatter_rows_f32@kernels@strata@@YAXPEBMPEAMPEBH_J3PEAX@Z
 //   reported by strata_vulkan_host.lib(peer_experts.obj) (1 mention(s))
@@ -1430,12 +1400,6 @@ unsigned __int64 strata::kernels::shared_expert_scratch_bytes(__int64) { strata:
 //   reported by generate.obj (1 mention(s))
 //   declared by include/strata/kernels/shared_expert.hpp
 void strata::kernels::shared_expert_set_native_bf16(bool) { strata::vulkan_engine::missing("strata::kernels::shared_expert_set_native_bf16"); }
-
-// strata::kernels::silu_inplace
-//   LNK2019: unresolved external symbol ?silu_inplace@kernels@strata@@YAXPEAM_JPEAX@Z
-//   reported by strata_vulkan_host.lib(layer.obj) (1 mention(s))
-//   declared by include/strata/kernels/elementwise.hpp
-void strata::kernels::silu_inplace(float * ,__int64,void *) { strata::vulkan_engine::missing("strata::kernels::silu_inplace"); }
 
 // strata::kernels::spec_draft_sample
 //   LNK2019: unresolved external symbol ?spec_draft_sample@kernels@strata@@YAXPEAMHPEBH1HPEBUSamplerParams@12@PEAHHH1PEAX303HM4@Z
