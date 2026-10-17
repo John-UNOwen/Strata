@@ -40,7 +40,7 @@ old sessions, `--sessions` lists them all. One arm alone: `bench/arms/run-arm.ba
 `k22ref`, `k22mirror6000`, `k22mirror10000`, `k22prefill16k`, `k22own4096`, `k22own4096mirror`, `k22ctx32k`, `k22ctx32kmirror`.
 The old split11-based arms (`make_arms.py`) stay for the frontier hunt itself.
 
-### First gated ladder (fresh data, exe 17:45 build, run 2026-10-16 ~21:20)
+### First gated ladder (fresh data, exe 17:45 build, run 2026-10-16 19:29-20:25)
 
 Every number below is new, gate-checked, one fresh server per arm:
 
@@ -72,6 +72,20 @@ What this settles:
 Next measurements (all plain launchers, N>=3 sessions): `BENCH-ARMS.bat k22ref k22ref k22ref`-style repeats to get
 per-shape storm *rates* (64K-auto vs 32K vs 16384-chunks), then a DBG-scan capture run on whichever shape storms
 accepting the masking caveat. The mirror arms can be dropped from the default ladder.
+
+### Baseline round (4 k22ref sessions, 19:29-21:06) - the certified baseline and the storm rate
+
+`BENCH-ARMS.bat k22ref` x3 (plus the original 19:29 session): **3 clean / 4 sessions** at the 64K auto-chunk shape,
+aggregating to **decode 22.2 (5% spread), 4K 377 (2%), 16K 628 (4%) - consistent**. This is the new baseline.
+
+- **k22 64K auto is ~75% clean, not immune**: the 4th session (21:06) stormed at the last short-chat request and the
+  new stop cut the session there before the prompt tests. Storm-rate so far: 32K context 1/1, 16384-chunks 1/1
+  (both lit inside the first two chat runs), 64K auto 1/4 (lit late in chat).
+- Every storm so far lit **inside the short-chat phase** (43-51 token prompts, 100-token decodes): mid-decode verify
+  windows, exactly the original fault signature. Short chats are the fuse; the bigger prompt shapes mostly inherit the
+  session state after ignition.
+- Deltas against the certified baseline (clean sessions only): mirrors neutral (within 4%); `own4096` holds its
+  trade (-27% decode, +32% 4K, +12% 16K) and ran clean 1/1 (small sample; needs its own 3-session round).
 
 **These morning numbers are pollution-unverified and now treated as suspect.** They were benched 06:2x-07:42 on the
 engine *before* the scratch-race fix (`9953a5b`, ~09:45), i.e. the version that provably NaN'd split11-class runs in

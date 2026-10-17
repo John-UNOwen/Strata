@@ -10,13 +10,15 @@ web app as the CUDA engine. Written for and measured on an Arc B580 (12 GB) + Ar
 - **Single card**: B580 alone or A770 alone, full 64K-128K context serving.
 - **Two Arc cards, mixed generations, the 22/26 layer split** (`--layer-split 22`, called k22): B580 layers 0-21,
   A770 layers 22-47. Works for text and for pictures (the vision encoder runs on the CPU). Benchmark-certified
-  IQ2_XS at 64K context (pollution-gated suite, 2026-10-16): **23 tokens/s decode**, prompt reads **377 tokens/s
-  (4K) / 618 (16K)**, drafts accepting up to ~86% on good prompts. 128K context also starts and serves.
+  IQ2_XS at 64K context (pollution-gated, 4 sessions 2026-10-16): **22 tokens/s decode**, prompt reads **377
+  tokens/s (4K) / 628 (16K)** in the 3 clean sessions, drafts accepting up to ~86% on good prompts.
+  128K context also starts and serves.
 - **Deeper A770-heavy splits are the open frontier**: a 32-layer A770 side (split16) ran text-only clean but NaNs as
   soon as pictures enter; the 37-layer side (split11) NaNs text at 64K and at 32K. The frontier is not purely the
   layer count either: in the gated ladder k22 itself produced storm sessions at 32K context and at 16384-token
-  prompt chunks, while 64K with the default chunks ran clean. Treat "clean" as per-shape, and re-check any new
-  context or chunk size with the gate (N>=3).
+  prompt chunks, while 64K with the default auto chunks ran 3 of 4 sessions clean (the 4th stormed in short chat).
+  Storms so far always lit inside short chat decode. Treat "clean" as per-shape with a rate: 64K auto about 3 in 4
+  sessions clean, 32K context and 16384-token chunks were 0 in 1 so far; re-check any new shape with the gate (N>=3).
 - Built-in drafts (speculation windows, `--spec 4`) work on all of these. The optional MTP drafter is **parked on
   the two-card Windows path** (see caveats).
 
