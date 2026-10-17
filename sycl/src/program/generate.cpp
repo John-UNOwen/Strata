@@ -11519,7 +11519,9 @@ int main(int argc, char **argv) try {
                 // the timing inside the window is untouched. This is the trace that turns "a session stormed" into
                 // "window N of this request was fully accepted, then the next window produced junk".
                 if (static const bool dbg_win = std::getenv("STRATA_DBG_WINDOW") != nullptr; dbg_win) {
-                    const bool full = a == T - 1 && a >= 8;
+                    // a window with T > 1 is fully accepted when every draft matched: accepted == T - 1 (T is at most 6
+                    // here, so an "accepted >= 8" test never fires and hid the case the first trace was added for).
+                    const bool full = T > 1 && a == T - 1;
                     std::fprintf(stderr, "strata window: %lld T=%d accepted=%d pos=%lld%s%s\n",
                                  (long long) ver.windows, T, a, (long long) p, full ? " FULL-WINDOW" : "",
                                  from_sfx ? " (suffix draft)" : "");

@@ -25,6 +25,8 @@ REM Sessions per arm above; BENCH_RUNS raises the number of runs INSIDE a sessio
 REM For fault hunting that matters: every storm so far lit inside the chat phase, so more runs = more ignition chances.
 set "RUNSARG="
 if not "%BENCH_RUNS%"=="" set "RUNSARG=--runs %BENCH_RUNS%"
+REM BENCH_SUITES=4K runs only that phase: a fault hunt repeats one suite instead of paying for the whole round.
+if not "%BENCH_SUITES%"=="" set "RUNSARG=!RUNSARG! --suites %BENCH_SUITES%"
 
 call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" >nul 2>&1
 cd /d "%~dp0"

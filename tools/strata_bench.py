@@ -266,9 +266,11 @@ def pctl(values, p):
 
 # ---------------------------------------------------------------------------------------------------- the suite
 class Suite:
-    def __init__(self, base, key, ctx, runs, think, log=print, want_clients=0, want_long=False, quick=False):
+    def __init__(self, base, key, ctx, runs, think, log=print, want_clients=0, want_long=False, quick=False,
+                 suites=""):
         self.base, self.key, self.ctx, self.runs, self.think, self.log = base, key, ctx, runs, think, log
         self.clients, self.want_long = want_clients, want_long
+        self.suites = suites
         self.quick = quick
         self.nonce = str(int(time.time()))
         self.tokens_per_word, self.overhead = 1.1, 40
@@ -483,6 +485,13 @@ class Suite:
             steps.append(("clients", lambda: self.run_clients(self.clients)))
         if self.want_long:
             steps.append(("32K", lambda: self.run_prompt(32768, "32K")))
+        if self.suites:   # --suites 4K: a fault hunt repeats one phase instead of paying for the whole round
+            keep = [s.strip().lower() for s in self.suites.split(",") if s.strip()]
+            steps = [s for s in steps if s[0].lower() in keep]
+            if not steps:
+                self.log("--suites matched no step; the full session runs")
+                steps = [("chat", self.run_chat), ("4K", lambda: self.run_prompt(4096, "4K")),
+                         ("16K", lambda: self.run_prompt(16384, "16K")), ("agent", self.run_agent)]
         for label, fn in steps:
             if self.polluted_abort:
                 self.out["skipped"][label] = "pollution detected earlier in this session"
@@ -1018,6 +1027,8 @@ def main(argv=None) -> int:
     ap.add_argument("--api-key", default=os.environ.get("STRATA_KEY", ""), help="the server's API key, if it has one (or STRATA_KEY)")
     ap.add_argument("--runs", type=int, default=3, help="runs per test (default 3)")
     ap.add_argument("--clients", type=int, default=0, metavar="N", help="also send N requests at once")
+    ap.add_argument("--suites", default="", metavar="LIST",
+                    help="run only these phases, comma separated: chat,4K,16K,agent,32K (a fault hunt repeats one)")
     ap.add_argument("--long", action="store_true", help="also a prompt of about 32,768 tokens")
     ap.add_argument("--think", action="store_true", help="leave thinking on (the default suite turns it off)")
     ap.add_argument("--out", help="where to write the results folder (default: bench/results)")
@@ -1079,7 +1090,8 @@ def main(argv=None) -> int:
                 return 1
         t0 = time.time()
         pre = collect_machine(base, key, cfg, a.gpu)
-        suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients, want_long=a.long)
+        suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients,
+                      want_long=a.long, suites=a.suites)
         slots = pre.get("parallel_slots") or 1
         if a.clients and a.clients > slots:
             say(f"Note: the server runs {slots} request(s) at a time (--batch), so {a.clients} clients will partly wait their turn.")
