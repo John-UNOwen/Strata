@@ -33,8 +33,12 @@ Branch `vulkan-backend` cut from `main` at `3364fdf`. What the review found, wit
   overflowing), 13802 MiB used, 1623 MiB free`, `offloaded 49/49 layers to GPU`, `Vulkan0 model buffer 13190 MiB`,
   `Vulkan2 (B580) model buffer 9272 MiB`, and two `CPU_Mapped` totals of 37,034 and 27,466 MiB, which is the 64.5 GiB
   mapped on 32 GB of RAM. Its output artifact is `VicGPT/benchmarks/vulkan-flashnext-auto_2026-10-17_000222.md`, a
-  coherent digest. Launcher: `VicGPT/scripts/test_vulkan_flashnext.ps1`. The **45-49 / 5.3-5.6 tok/s figures of this
-  plan are in no file in either repo**: re-run that test and keep its report before quoting them as measured.
+  coherent digest. Launcher: `VicGPT/scripts/test_vulkan_flashnext.ps1`. The 45-49 / 5.3-5.6 tok/s figures and the
+  "~330 s of model time against Strata's ~67 s" are recorded in the KB note
+  `llamacpp-vulkan-flashnext-test-2026-10-17`, but the log that note cites
+  (`VicGPT/logs/vulkan-flashnext-auto_2026-10-17_000222.log`) is **not in the VicGPT repo under that name**: what is on
+  disk is `...2026-10-16_235708.log` (5 lines, a start that was stopped) and `...2026-10-16_235849.log.stderr`. Re-run
+  the test and keep its report before treating the two speeds as measured.
 - **Counts corrected.** `include/strata/kernels/*.hpp` is 51 files, not 52. `native_head.hpp` is at
   `include/strata/core/native_head.hpp`. The doorbell this plan names is `sycl/include/strata/sycl_doorbell.hpp`, a
   SYCL-only file; Vulkan needs its own. `metal/src/engine` is 14 files / 5,227 lines, `stubs.cpp` is 367 lines holding
@@ -49,7 +53,7 @@ Branch `vulkan-backend` cut from `main` at `3364fdf`. What the review found, wit
   (`OPTIMIZATIONS-2026-10-16.md`, "Where things stand").
 - **llama.cpp Vulkan on the same model and PC** (VicGPT's auto-fit run, cited file by file in the review above): a
   clean, coherent digest with **36 layers on the A770** and 49/49 offloaded across the two cards, but prompt 45-49 tok/s
-  and decode 5.3-5.6 tok/s (those two figures are remembered, not in a file, and need a re-run before they are quoted).
+  and decode 5.3-5.6 tok/s (KB-recorded; the log that record cites is not on disk under that name, see the review).
   Its slowness is llama.cpp's memory layout: no hot-expert cache, 22 layers' experts on the CPU, 64.5 GiB mapped on 32
   GB of RAM so decode pages from the SSD. It is not evidence about Vulkan kernels.
 - **So the bet is:** Vulkan's driver path may not have the >26-layer fault, and Strata's layout is what makes this
@@ -298,6 +302,6 @@ entry points a working engine needed: its 248 stubs are the ones it did not.
 - `sycl/src/kernels/*_parity.cpp`: parity oracles and tolerances.
 - The VicGPT test behind this plan, on this PC: `VicGPT/scripts/test_vulkan_flashnext.ps1`,
   `VicGPT/logs/vulkan-flashnext-auto_2026-10-16_235849.log.stderr` (the fit: 36 layers on the A770, 64.5 GiB mapped),
-  `VicGPT/benchmarks/vulkan-flashnext-auto_2026-10-17_000222.md` (the coherent digest), and
-  `VicGPT/benchmarks/sycl-vs-vulkan_2026-10-15_082834/` for the earlier llama.cpp Vulkan runs (those are qwen35 27B
-  Q4_K, not this model).
+  `VicGPT/benchmarks/vulkan-flashnext-auto_2026-10-17_000222.md` (the coherent digest), the KB note
+  `llamacpp-vulkan-flashnext-test-2026-10-17`, and `VicGPT/benchmarks/sycl-vs-vulkan_2026-10-15_082834/` for the earlier
+  llama.cpp Vulkan runs (those are qwen35 27B Q4_K, not this model).
