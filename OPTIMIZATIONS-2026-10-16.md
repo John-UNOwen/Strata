@@ -200,30 +200,43 @@ certified baseline. The 32K split11 probe still has no gate-checked prompt numbe
 Detection is solved (the gate plus `tools/arms_logscan.py`). What is missing is localization: which window, which stage,
 which buffer. This is the loop for that.
 
-**The test bed.** The 32K shape stormed 1 in 1 and aborts inside the first chat run, so a polluted session costs
-minutes, not a round: `BENCH-ARMS.bat k22ctx32k <control>` gives the reference and the control back to back.
+**The test bed.** The 32K shape stormed in both of its sessions (20:18 at chat q2, 22:57 at chat q1) and aborts inside
+the first chat run, so a polluted session costs minutes, not a round: `BENCH-ARMS.bat k22ctx32k <control>` gives the
+reference and the control back to back.
 
-**The clue we have not used: it is nearly always q3.** Five of the six chat storms lit on the third chat prompt, the
-list prompt ("List ten practical tips..., one sentence each"), and the 21:58 reply was a numbered list item that became
-`!`. That is the content where the draft head proposes whole windows and the verifier accepts all of them, which every
-junk window shows (`drafts accepted 48 of 48`, `29 of 29`) together with a speed spike. So the first hypothesis is the
-**fully accepted verify window path** (`Verifier::copy_` staging plus flag-B doorbell, `verify.cpp:2523-2553`), not the
-A770 layout. The controls below are ordered to test that first.
+**What the engine cannot do.** There is no "no speculation" configuration on this model: the native IQ pack refuses to
+start below `--spec 2` ("C:\strata-data\packs\iq2_xs is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2)
+and --prefill CHUNK", seen 3 times on 22:57). So the multi-token verify window is not optional, it is the only way this
+engine runs IQ2_XS, and the fault has to be found inside the window machinery rather than by turning it off. The
+no-draft control is `--spec 2 --spec-min-p 1`: the window stays, no draft is ever offered.
 
-**Controls** (`python bench/arms/make_arms_k22.py`, one change each against `k22ctx32k`, read them as "did the storm
-rate move", never as speed):
+**Where storms ignite.** Chat storms have now lit on q3 four times (the list prompt, where a numbered list item became
+`!`), on q2 once and on q1 once (the merge-function code prompt, 22:57), plus one long agent turn. So it is not a
+property of one prompt: the common factor is a highly predictable continuation, the content where the draft head
+proposes whole windows and the verifier accepts all of them, which every junk window shows (`drafts accepted 48 of 48`,
+`29 of 29`) together with a speed spike. The first hypothesis stays the **fully accepted verify window path**
+(`Verifier::copy_` staging plus flag-B doorbell, `verify.cpp:2523-2553`), not the A770 layout.
+
+**Controls** (`python bench/arms/make_arms_k22.py`, one change each against `k22ctx32k`, every one of them carrying
+`--max-context 32768`; a first cut forgot that and silently measured the 64K shape. Read them as "did the storm rate
+move", never as speed):
 
 | Arm | Change | A change in the rate proves |
 |---|---|---|
-| `k22ctx32kspec0` | `--spec 0` | the fault lives in the draft/verify path, not prefill or layout |
-| `k22ctx32kspec2` | `--spec 2` | a depth threshold (if 0 is clean and 2 storms, it needs a window big enough to accept fully) |
+| `k22ctx32kspec1p` | `--spec 2 --spec-min-p 1` | the window shape stays, no draft is offered: the fault is in drafting, not in the window |
+| `k22ctx32kspec2` | `--spec 2` | a depth threshold (a full window has to be big enough to be fully accepted) |
 | `k22ctx32keager` | `STRATA_VERIFY_EAGER=1` | ordering vs data: eager fails as error 40, graphs as a hang |
 | `k22ctx32kkvf16` | `--kv f16` | the KV arena placement matters as much as the dtype |
 | `k22ctx32ksmallcache` | `STRATA_VRAM_FREE_MIB=0,11000` | buffer placement around the 4 GiB line matters |
 | `b580only32k` | B580 only, all 48 layers | the split, the hand-off and the second card are innocent if it still storms |
 | `a770only32k` | A770 only, all 48 layers | ditto, and which stage manufactures it |
 
-**The instruments** (this engine build carries them: `build-sycl-jit\strata.exe`):
+`spec1p` and `a770only32k` were brought up once each in a bounded startup probe (75 s, then killed): the first filled a
+7.10 GiB cache, the single-card A770 arm filled 7.83 GiB from 5818 experts, so both are valid configs, not just valid
+JSON.
+
+**The instruments** (this engine build carries them: `build-sycl-jit\strata.exe`, and the fault-search arms switch the
+window trace on in their own env block, so nothing has to be set by hand):
 
 - `STRATA_DBG_WINDOW=1`: one line per verify window, host counters only, no device work and no sync, so the timing
   inside the window is untouched: `strata window: 41 T=6 accepted=5 pos=1234 FULL-WINDOW (suffix draft)`.
@@ -236,17 +249,16 @@ rate move", never as speed):
 - `STRATA_DBG_NAN` (in-window scans) stays as the last resort only: it perturbs the window, so a clean run with it on
   proves nothing.
 
-**Recipe** (the shape that already storms, more ignition chances per session):
+**Recipe:**
 ```
-set BENCH_TRACE=1
 set BENCH_RUNS=6
-set BENCH_REPEATS=3
-BENCH-ARMS.bat k22ctx32k k22ctx32kspec0
+BENCH-ARMS.bat k22ctx32k k22ctx32kspec1p
 ```
-`BENCH_TRACE=1` makes `make_arms_k22.py` regenerate every arm with both instruments on (it runs inside the ladder), so
-the engine log of the round carries the window trace and any non-finite report. Then read the gate verdict in
-`bench\results\arms\...` and `python tools\arms_logscan.py strata-arm-k22ctx32k.log`. Start with one reference session
-plus one control; add repeats only once the trace shows something.
+One reference session plus one control is enough to read the first answer (the 32K shape ignites in its first chat run),
+then add `k22ctx32kkvf16` and `a770only32k`. `BENCH_RUNS` raises the runs inside a session for more ignition chances;
+`BENCH_TRACE=1` adds the deferred non-finite scan on top of the window trace. Read the gate verdict in
+`bench\results\arms\...`, then `python tools\arms_logscan.py strata-arm-k22ctx32k.log`, then the window trace lines in
+the same log.
 
 ## Speed (no MTP)
 
