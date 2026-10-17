@@ -26,12 +26,13 @@ arms on them mixes speed with a moving fault. **k22 daily numbers** (`start-2car
 now): prompt 260-320 tok/s, decode 18-25, suffix drafts up to ~86% accepted. k22 also serves images (CPU encoder,
 280-297 tok/s map prompts): at k22 the bigger B580 share no longer buys prompt speed, so the frontier costs little today.
 
-Against VicGPT's bar and the old llama.cpp Vulkan model (two-card numbers now gate-certified by k22ref):
-- **Prompt:** k22 377 (4K) / 628 (16K) tok/s certified; its map-sized 8-18K warm reads run 200-330. llama.cpp ran
-  380-420 at 16K, so k22 is ahead but the split11-class 851 remains the number the frontier hunt could restore.
-- **Decode:** k22 22.2 tok/s certified (22.9 in the best session) is about 1.4x llama.cpp's ~16.
+Against VicGPT's bar and the old llama.cpp Vulkan model (two-card numbers gate-certified by k22ref):
+- **Prompt:** k22 365 (4K) / 608 (16K) tok/s over 6 clean sessions (377 / 628 in the early-evening epoch); its
+  map-sized 8-18K warm reads run 200-330. llama.cpp ran 380-420 at 16K, so k22 is behind it on short prompts and ahead
+  on long ones, and the split11-class 851 remains the number the frontier hunt could restore.
+- **Decode:** k22 21.5 tok/s certified (22.9 in the best session) is about 1.35x llama.cpp's ~16.
 - **A 10k-token map chunk** in a warm session reads in about 30-50 s at k22 (it was 12-16 s at split11); a cold 4K or
-  16K prompt runs at the certified 377 / 628.
+  16K prompt runs at the certified 365 / 608.
 
 **Arms for the k22 baseline**: `python bench/arms/make_arms_k22.py` writes the configs; `BENCH-ARMS.bat` (repo root)
 then runs the whole ladder automatically - each arm in **3 separate fresh server sessions** (ports 8191+; 3 is the
@@ -43,14 +44,15 @@ old sessions, `--sessions` lists them all. One arm alone: `bench/arms/run-arm.ba
 The old split11-based arms (`make_arms.py`) stay for the frontier hunt itself.
 
 Arm ledger after the first gated rounds (details in the two sections below):
-- `k22ref`: **certified baseline**, decode 22.2 (5% over sessions), 4K 377, 16K 628, 3 of 4 sessions clean.
+- `k22ref`: **certified baseline**, decode 21.5 (9% over sessions; 22.2 in the early epoch, 21.1 late), 4K 364.9,
+  16K 608.5, 6 of 7 sessions clean.
 - `k22mirror6000` / `k22mirror10000`: **dropped**. Neutral within 4%, and by construction they only exercise the part of
   the mirror that cannot matter at k22 (speed item 1).
-- `k22own4096`: **settled**, 4 sessions, decode 16.1 (7%), 4K 494.5 (4%), 16K 698.1 (6%): -27% decode for +31% / +11%
-  prompt. The map-reading profile if VicGPT cares more about 8-18k reads than answer speed.
-- `k22own4096mirror`: 17.9 / 500 / 706 in one session - pays less decode than plain own4096 for the same prompt win.
-  The one arm still worth 3 sessions. A second attempt (21:58) stormed in its first session, in chat run 2, so the arm
-  is still 1 clean session; the ladder now skips just that arm instead of ending the round.
+- `k22own4096`: **settled**, 4 sessions, decode 16.1 (7%), 4K 494.5 (4%), 16K 698.1 (6%): -25% decode for +35% / +15%
+  prompt.
+- `k22own4096mirror`: **settled and the better map arm**, 2 clean of 4 sessions, decode 17.5 (4%), 4K 493.7 (3%),
+  16K 696.6 (3%): -19% decode for the same +35% / +14% prompt win as plain own4096. Two of its four sessions stormed,
+  which is the one thing to watch (robustness item 0).
 - `k22prefill16k`, `k22ctx32k`, `k22ctx32kmirror`: **void** (storms in the first two chat runs). Revisit only after the
   frontier moves (robustness item 0), not before.
 
@@ -95,26 +97,35 @@ are dead, own4096 is settled. What is left:
 3. No more 32K or 16384-chunk arm runs until the frontier moves. Those shapes are 0 for 1 and re-measuring a known
    storm tells us nothing; the chunk-size work in speed item 3 is gated on robustness item 0 first.
 
-### Baseline round (4 k22ref sessions, 19:29-21:06) - the certified baseline and the storm rate
+### Baseline round (7 k22ref sessions, 19:29-22:45) - the certified baseline, the drift and the storm rate
 
-`BENCH-ARMS.bat k22ref` x3 (plus the original 19:29 session): **3 clean / 4 sessions** at the 64K auto-chunk shape,
-aggregating to **decode 22.2 (5% spread), 4K 377 (2%), 16K 628 (4%) - consistent**. This is the new baseline.
+`BENCH-ARMS.bat k22ref` x6 (plus the original 19:29 session): **6 clean / 7 sessions** at the 64K auto-chunk shape,
+aggregating to **decode 21.5 (9% spread), 4K 364.9 (7%), 16K 608.5 (9%) - consistent**. This is the baseline.
 
-- **k22 64K auto is ~75% clean, not immune**: the 4th session (21:06) stormed at the last short-chat request and the
-  new stop cut the session there before the prompt tests. Storm-rate so far: 32K context 1/1, 16384-chunks 1/1
-  (both lit inside the first two chat runs), 64K auto 1/4 (lit late in chat).
-- **Short chat is the usual fuse, not the only one**: `own4096`'s 3-session round (21:32-21:45) added a storm in the
+- **A long evening drifts down by about 5-7%.** The first three clean sessions read 22.2 / 377 / 628 (medians); the
+  three run at 22:26-22:45 read 21.1 / 356 / 598. Nothing changed in the config between them, so the late numbers carry
+  a session-order penalty (heat or background load). The aggregate above mixes both epochs, so quote an arm relative to
+  a baseline session from the same hour, and interleave arms in a round rather than running one arm per evening.
+  `arms_summary.py --sessions` now prints each arm's drift (last clean vs first clean): `k22ref` -6.6%,
+  `own4096mirror` -3.9%, `own4096` +0.0% (all four of its sessions sit in the same hour).
+- **k22 64K auto is about 1 in 4 clean-session-losses, not immune**: 4 of the 17 sessions at this shape stormed. The
+  other shapes are worse (32K context 1/1, 16384-chunks 1/1) and every storm so far lit in chat, except one agent turn.
+- **Short chat is the usual fuse, not the only one**: `own4096`'s round (21:32-21:45) added a storm in the
   **agent phase** (run 1 turn 4, the 11498-token turn that reuses 8577 tokens). That session's chat and prompt numbers
-  stayed valid (the fault does not reach backwards); `tools/arms_summary.py` now voids a session from the polluted
-  suite onwards instead of dropping the whole session.
+  stayed valid (the fault does not reach backwards); `tools/arms_summary.py` voids a session from the polluted suite
+  onwards instead of dropping the whole session.
 - **The engine log carries the same signature, independently of the reply text**: the junk replies accept every
-  suffix draft (`drafts accepted 29 of 29`, `48 of 48`, `30 of 30`) and run 1.3-2x the session's normal pace
+  suffix draft (`drafts accepted 29 of 29`, `48 of 48`, `42 of 42`) and run 1.3-2x the session's normal pace
   (30.1 tok/s where the session ran 17.9; 36 tok/s where it ran 15.7). `tools/arms_logscan.py` reads the
-  `strata serve: prompt ...` lines and flags the same 5 storm sessions the client gate flagged, with no false hit in
-  the 9 clean ones. This is the second opinion to use on any log whose results.json predates the gate.
-- Deltas against the certified baseline (clean suites): mirrors neutral (within 4%); `own4096` is settled after
-  4 sessions (one polluted in the agent phase, chat/prompts valid): **decode 16.1 (7% spread), 4K 494.5 (4%),
-  16K 698.1 (6%) - consistent**, i.e. -27% decode for +31% 4K and +11% 16K.
+  `strata serve: prompt ...` lines and flagged all 7 storm sessions of the evening with no false hit in the 13 clean
+  ones. This is the second opinion to use on any log whose results.json predates the gate.
+- Deltas against the certified baseline (clean suites, same-hour caveat above):
+  - `k22own4096`: 4 sessions, **decode 16.1 (7% spread), 4K 494.5 (4%), 16K 698.1 (6%)** = -25% decode, +35% 4K,
+    +15% 16K.
+  - `k22own4096mirror`: 2 clean of 4 sessions, **decode 17.5 (4%), 4K 493.7 (3%), 16K 696.6 (3%)** = -19% decode,
+    +35% 4K, +14% 16K. It wins the trade: the same prompt speed for 7 points less decode penalty than plain own4096.
+    Watch its storm rate though, 2 of its 4 sessions (see robustness item 0).
+  - mirrors of the stage-0 host path: neutral within 4% (see speed item 1 for why that is expected).
 
 `tools/strata_bench.py` now carries a client-side **pollution gate**: every reply (warmup included) is scored for
 storm signatures (long single-character bursts) and degenerate loops; any hit voids the session's numbers, STOPS the
@@ -180,6 +191,9 @@ certified baseline. The 32K split11 probe still has no gate-checked prompt numbe
 - Read the engine log too: a storm shows up as 100% suffix-draft acceptance plus a decode speed spike
   (`python tools/arms_logscan.py` prints those rows per session). It catches storms in logs whose results.json
   predates the gate, and it corroborates a gate hit without trusting the reply text.
+- Keep the epoch in mind: a long evening drifts down about 5-7% (see the baseline round section). Interleave arms
+  inside a round and compare an arm against a baseline session from the same hour; `arms_summary.py --sessions`
+  prints each arm's drift.
 
 ## Speed (no MTP)
 
@@ -210,8 +224,9 @@ certified baseline. The 32K split11 probe still has no gate-checked prompt numbe
    - Once its mirror segment is allocated through the A770's queue, change the gate to compare the stage's device with the mirror segment's owner instead of CUDA0. Then the copy kernels read it in place on the card that owns it.
    - The A770 is on PCIe 4.0 x16. Fresh ladder probes read 12.0-16.0 GB/s (`pcie_frac` 0.33-0.44, and it moves between
      sessions), against 17-22 GB/s in the earlier probe; budget with the lower figure.
-3. **Prompt chunk size.** Measured so far: `--prefill 4096` with own buffers is the only chunk lever that paid
-   (`k22own4096`, settled at +31% 4K / +11% 16K for -27% decode); `k22prefill16k` (the `auto:16384` case) is **void**,
+3. **Prompt chunk size.** Measured so far: `--prefill 4096` with own buffers is the chunk lever that paid
+   (`k22own4096` settled at +35% 4K / +15% 16K for -25% decode; `k22own4096mirror` gets the same prompt win at only
+   -19% decode, so it is the better map arm); `k22prefill16k` (the `auto:16384` case) is **void**,
    it stormed in chat run 2 and never produced a number, and both 32K arms are void too. So the 16K-chunk question is
    still open but it is now a frontier question, not a tuning one: any chunk large enough to help is also a shape that
    lit the fault at 32K. Do robustness item 0 first.
@@ -250,9 +265,13 @@ certified baseline. The 32K split11 probe still has no gate-checked prompt numbe
    restart; the `STRATA_DBG_NAN` sync scans masked the fault in 2/2 runs, so gate conclusions on plain launchers,
    N>=3. Evidence: KB `references/split11-nan-story-2026-10-16.md` (Update 18:40) and the probe timelines in
    `bench/results/handoff-mtp-k22-2026-10-16.md`.
-   - **The frontier is per-shape and has a rate, not a yes/no.** Measured storm rate so far: 32K context 1/1 void,
-     16384-token chunks 1/1, 64K auto 1/4 (75% clean), and the k22 *decode* shape itself stays clean at 22.2 tok/s
-     over 3 clean sessions. So "k22 is clean" means "clean at this shape, usually".
+   - **The frontier is per-shape and has a rate, not a yes/no.** Storm counts so far: 7 polluted in 20 sessions, and at
+     the 64K auto shape it is 4 of 17 (about 1 in 4). 32K context 1/1 void, 16384-token chunks 1/1. The k22 *decode*
+     shape itself stays clean at 21.5 tok/s over 6 clean sessions. So "k22 is clean" means "clean at this shape, usually".
+   - **The rate may be arm-dependent; watch it.** `k22own4096mirror` stormed 2 of its 4 sessions, `k22ref` 1 of 7,
+     `k22own4096` 1 of 4. At these counts that is not proof (a 2-of-4 against 1-of-7 could be luck), but if it repeats it
+     points at the own-buffer plus mirror configuration rather than the shape. Note it before trusting that arm's
+     daily-use storm rate.
    - **Two fuses, both inside the model forward:** short chats (43-51 tokens, 100-token decode, mid-decode verify
      window) and, once, a long agent turn (11498 tokens, 8577 reused, `drafts accepted 29 of 29` at 30.1 tok/s). Both
      are verify-window shapes, which is why the fault also leaves a fingerprint in the log (see How to measure).

@@ -10,15 +10,17 @@ web app as the CUDA engine. Written for and measured on an Arc B580 (12 GB) + Ar
 - **Single card**: B580 alone or A770 alone, full 64K-128K context serving.
 - **Two Arc cards, mixed generations, the 22/26 layer split** (`--layer-split 22`, called k22): B580 layers 0-21,
   A770 layers 22-47. Works for text and for pictures (the vision encoder runs on the CPU). Benchmark-certified
-  IQ2_XS at 64K context (pollution-gated, 4 sessions 2026-10-16): **22 tokens/s decode**, prompt reads **377
-  tokens/s (4K) / 628 (16K)** in the 3 clean sessions, drafts accepting up to ~86% on good prompts.
+  IQ2_XS at 64K context (pollution-gated, 7 sessions 2026-10-16): **21.5 tokens/s decode**, prompt reads **365
+  tokens/s (4K) / 608 (16K)** across the 6 clean sessions, drafts accepting up to ~86% on good prompts. The first
+  sessions of an evening read 22.2 / 377 / 628 and the numbers drift down about 5% after hours of benchmarking.
   128K context also starts and serves.
 - **Deeper A770-heavy splits are the open frontier**: a 32-layer A770 side (split16) ran text-only clean but NaNs as
   soon as pictures enter; the 37-layer side (split11) NaNs text at 64K and at 32K. The frontier is not purely the
   layer count either: in the gated ladder k22 itself produced storm sessions at 32K context and at 16384-token
-  prompt chunks, while 64K with the default auto chunks ran 3 of 4 sessions clean (the 4th stormed in short chat).
-  Storms so far always lit inside short chat decode. Treat "clean" as per-shape with a rate: 64K auto about 3 in 4
-  sessions clean, 32K context and 16384-token chunks were 0 in 1 so far; re-check any new shape with the gate (N>=3).
+  prompt chunks. Treat "clean" as per-shape with a rate: at the 64K auto shape 4 of 17 sessions stormed (about 1 in 4),
+  32K context and 16384-token chunks are 0 for 1 so far, and 7 of 20 sessions overall. A storm usually lights inside
+  short chat decode, once inside a long agent turn, and it can start mid-reply. Re-check any new shape with the
+  benchmark gate (N>=3) and treat a stormed session as void.
 - Built-in drafts (speculation windows, `--spec 4`) work on all of these. The optional MTP drafter is **parked on
   the two-card Windows path** (see caveats).
 
@@ -100,4 +102,4 @@ N>=3 identical runs.
 The serve log carries its own pollution signature, independent of the reply text: a junk reply accepts every suffix
 draft (`drafts accepted 48 of 48`) and runs about 1.3-2x the session's normal decode speed, because the model is
 emitting one repeated token. `python tools/arms_logscan.py` reads those `strata serve: prompt ...` lines and prints
-the suspicious rows per session; it flagged all five known-storm sessions and none of the nine clean ones.
+the suspicious rows per session; it flagged all seven known-storm sessions of 2026-10-16 and none of the thirteen clean ones.

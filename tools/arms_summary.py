@@ -81,6 +81,19 @@ def fmt(v, digits=1, spread=None):
     return s
 
 
+def epoch_drift(rows: list[dict]) -> float | None:
+    """Percent change in decode from the first clean session to the last, in time order.
+
+    A long evening of benchmarking drifts down (about 5% over an hour here: heat, background load), and an arm measured
+    late against a baseline measured early looks better than it is. Reading the drift next to the deltas keeps the two
+    effects apart.
+    """
+    vals = [r["decode"] for r in rows if r["decode"] is not None]
+    if len(vals) < 2 or not vals[0]:
+        return None
+    return (vals[-1] - vals[0]) / vals[0] * 100
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--arms", default="bench/results/arms")
@@ -144,6 +157,9 @@ def main() -> int:
                     note = f" POLLUTED at {r['first_pollution']} (whole session void)"
                 print(f"  {name:22s} {r['stamp']}  decode {fmt(r['decode']):>6s}  4K {fmt(r['4K'], 0):>5s}  "
                       f"16K {fmt(r['16K'], 0):>5s}  polluted {r['polluted']}{note}")
+            drift = epoch_drift(rows)
+            if drift is not None:
+                print(f"  {name:22s}        drift over the round (last clean vs first clean): {drift:+.1f}%")
     print(f"\nAggregates use every session that reached a suite clean ({len(clean)} of {len(rows)} where shown); a "
           f"session polluted later keeps its earlier suites. Spread is max-min over those session medians. tol "
           f"{a.tol:.0f}%. A 'consistent' arm still needs its numbers read against the baseline row.")
