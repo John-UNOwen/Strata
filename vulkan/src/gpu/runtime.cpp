@@ -1275,9 +1275,19 @@ bool bind_span(Device& d, VkBuffer buf, uint64_t off, uint64_t bytes, VkDescript
         return false;
     }
     if (off % d.align_storage) {
+        // Two things were wrong in this branch, both measured on 2026-10-17 with strata_parity_elementwise (built
+        // from ../src/kernels/elementwise_parity.cpp, whose line 387 passes `out + 1`, a pointer 4 B into its
+        // allocation).  The format was "offset %llu on %s ... alignment %llu" with the arguments in the order
+        // (off, align_storage, deviceName), so the %s was handed the integer 64 and std::fprintf died at address 64:
+        // the runtime crashed inside its own error message, printing "strata vulkan: " and nothing after it.  And a
+        // note that then carries on lets vkUpdateDescriptorSets write a descriptor offset that is not a multiple of
+        // minStorageBufferOffsetAlignment, which is a second fault one submit away.  Right order now, and refused.
         note("bind-align", "a descriptor offset of %llu on %s is not a multiple of minStorageBufferOffsetAlignment "
-                           "%llu (the block's own base address is what made it so)\n", (unsigned long long) off,
-             (unsigned long long) d.align_storage, d.props.deviceName);
+                           "%llu (the block's own base address is what made it so).  This binding cannot be written "
+                           "and the dispatch is refused: a kernel that needs a pointer into the middle of an "
+                           "allocation needs its own span, or the device pointer route.\n",
+             (unsigned long long) off, d.props.deviceName, (unsigned long long) d.align_storage);
+        return false;              // vkUpdateDescriptorSets would take an illegal offset from here
     }
     return true;
 }
@@ -1526,7 +1536,8 @@ Error record_dispatch(Device& d, StreamImpl* s, Pipeline& p, const LaunchConfig&
         if (sp2 != nullptr) {
             const uint64_t inside = addr - sp2->addr;                 // the OFFSET may be past 4 GiB ...
             bi.range = std::min<uint64_t>(sp2->bytes - inside, block_limit(d));   // ... the RANGE may not
-            bind_span(d, sp2->block->buf, sp2->block_off + inside, bi.range, bi); // ... and both are checked here
+            if (!bind_span(d, sp2->block->buf, sp2->block_off + inside, bi.range, bi))    // ... and both are checked here
+                return fail(kErrorInvalidValue);          // bind_span said why, on stderr
         } else {
             note("param-addr", "the kernel %s was given the device address %llu, which is not an allocation this "
                                "runtime handed out; its storage binding is left empty\n", p.name.c_str(),
