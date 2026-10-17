@@ -49,7 +49,8 @@ Arm ledger after the first gated rounds (details in the two sections below):
 - `k22own4096`: **settled**, 4 sessions, decode 16.1 (7%), 4K 494.5 (4%), 16K 698.1 (6%): -27% decode for +31% / +11%
   prompt. The map-reading profile if VicGPT cares more about 8-18k reads than answer speed.
 - `k22own4096mirror`: 17.9 / 500 / 706 in one session - pays less decode than plain own4096 for the same prompt win.
-  The one arm still worth 3 sessions.
+  The one arm still worth 3 sessions. A second attempt (21:58) stormed in its first session, in chat run 2, so the arm
+  is still 1 clean session; the ladder now skips just that arm instead of ending the round.
 - `k22prefill16k`, `k22ctx32k`, `k22ctx32kmirror`: **void** (storms in the first two chat runs). Revisit only after the
   frontier moves (robustness item 0), not before.
 
@@ -118,7 +119,8 @@ aggregating to **decode 22.2 (5% spread), 4K 377 (2%), 16K 628 (4%) - consistent
 `tools/strata_bench.py` now carries a client-side **pollution gate**: every reply (warmup included) is scored for
 storm signatures (long single-character bursts) and degenerate loops; any hit voids the session's numbers, STOPS the
 suite at that point (exit code 3; the rest of the tests are marked skipped), prints a POLLUTED banner and lists the
-flagged replies in the report; `BENCH-ARMS.bat` aborts the whole ladder on exit 3. It needs no engine debug flags -
+flagged replies in the report; `BENCH-ARMS.bat` treats exit 3 as "this session is void": it skips the rest of that arm
+(the shape just stormed) and continues with the next one. It needs no engine debug flags -
 whose synchronous scans can mask the fault (2/2 runs). Re-baseline every claim on the fixed engine with this gate:
 `run-arm.bat k22ref` first.
 
@@ -254,7 +256,12 @@ certified baseline. The 32K split11 probe still has no gate-checked prompt numbe
    - **Two fuses, both inside the model forward:** short chats (43-51 tokens, 100-token decode, mid-decode verify
      window) and, once, a long agent turn (11498 tokens, 8577 reused, `drafts accepted 29 of 29` at 30.1 tok/s). Both
      are verify-window shapes, which is why the fault also leaves a fingerprint in the log (see How to measure).
-   - **A session stops at the first polluted reply** (suite exit 3, ladder aborts) and `arms_summary.py` voids only
+   - **It does not always start at token 0.** The gate-checked 21:58 storm (own4096mirror) produced fluent text, then a
+     87-character `!` burst mid-reply (`char_loop` 0.54, `max_run` 87) - so the historical "token-0 storm" name describes
+     the first observed variant, not the fault's shape. The gate scores the whole reply, which is why it still catches it.
+   - **A session stops at the first polluted reply** (suite exit 3); `BENCH-ARMS.bat` then skips the rest of that arm
+     and moves on, since the storm rate is per session (about 1 in 4 at 64K auto, so aborting the whole ladder on one
+     storm threw away good arms). `arms_summary.py` voids only
      the suites from that point on, so data measured before ignition is still used. Do not "measure through" a storm.
    - **Next probe target:** the agent turn, not the chat. It is the one ignition we can schedule on demand.
 1. **Teardown crash on the "no room" refusal.**
