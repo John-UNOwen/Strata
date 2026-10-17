@@ -18,8 +18,10 @@ web app as the CUDA engine. Written for and measured on an Arc B580 (12 GB) + Ar
   soon as pictures enter; the 37-layer side (split11) NaNs text at 64K and at 32K. The frontier is not purely the
   layer count either: in the gated ladder k22 itself produced storm sessions at 32K context and at 16384-token
   prompt chunks. Treat "clean" as per-shape with a rate: at the 64K auto shape 4 of 17 sessions stormed (about 1 in 4),
-  32K context and 16384-token chunks are 0 for 1 so far, and 7 of 20 sessions overall. A storm usually lights inside
-  short chat decode, once inside a long agent turn, and it can start mid-reply. Re-check any new shape with the
+  32K context is now 3 for 3 (23:17 and 23:36 both lit on the first reply after a 4K prefill: 24 tokens of `!` from the
+  first character, in a single-token window with no drafts, after a prefill at 539-541 tok/s where clean sessions read
+  425-445), 16384-token chunks 0 for 1, and 9 of 22 sessions overall. A storm usually lights inside short chat decode,
+  once inside a long agent turn, and it can start mid-reply. Re-check any new shape with the
   benchmark gate (N>=3) and treat a stormed session as void.
 - Built-in drafts (speculation windows, `--spec 4`) work on all of these. The optional MTP drafter is **parked on
   the two-card Windows path** (see caveats).

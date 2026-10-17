@@ -210,12 +210,33 @@ and --prefill CHUNK", seen 3 times on 22:57). So the multi-token verify window i
 engine runs IQ2_XS, and the fault has to be found inside the window machinery rather than by turning it off. The
 no-draft control is `--spec 2 --spec-min-p 1`: the window stays, no draft is ever offered.
 
-**Where storms ignite.** Chat storms have now lit on q3 four times (the list prompt, where a numbered list item became
-`!`), on q2 once and on q1 once (the merge-function code prompt, 22:57), plus one long agent turn. So it is not a
-property of one prompt: the common factor is a highly predictable continuation, the content where the draft head
-proposes whole windows and the verifier accepts all of them, which every junk window shows (`drafts accepted 48 of 48`,
-`29 of 29`) together with a speed spike. The first hypothesis stays the **fully accepted verify window path**
-(`Verifier::copy_` staging plus flag-B doorbell, `verify.cpp:2523-2553`), not the A770 layout.
+**Where storms ignite.** Chat storms lit on q3 four times (the list prompt, where a numbered list item became `!`), on
+q2 once and on q1 once, plus one long agent turn. Then the 23:17 and 23:36 sessions moved the ignition into the **4K
+suite**: both polluted on 4K run 1 with a 24-token reply that was `!` from the first character. The window trace says
+where: the reply starts at position 4018 in a **T=1, accepted=0 window** (no draft was proposed or accepted for the
+first 7 to 13 tokens), so the draft machinery is not required for the corruption. The junk is highly predictable once
+it starts, which is why the draft head then proposes and wins whole windows (`6 of 6`, `9 of 9`) and the decode runs
+faster than a clean reply. Drafts are a symptom, not the cause.
+
+**What the storming 4K request looked like** against two clean sessions of the same arm:
+
+| | clean 4K runs | storming 4K run 1 |
+|---|---|---|
+| prompt speed | 425-445 tok/s | **539 and 541 tok/s** |
+| drafts | 0 of 0 | 6 of 6, 9 of 9 |
+| decode | 17-21 tok/s | 22.6, 25.7 tok/s |
+| reply | text | 24 x `!` |
+
+That "+24% prompt speed" is the useful tell: the storming prefill did **less work per token**, which is what a bigger
+chunk (one pass instead of two) or a misplaced one looks like. So the leading hypothesis is now the prefill chunk and
+its placement at 32K context, not the draft path: `k22ctx32kchunk8k` (`--prefill 8192`, one chunk for a 4K prompt) and
+`k22ctx32kchunk1k` (`--prefill 1024`, four chunks) test it directly. If fixed 8192 storms at ~540 tok/s and fixed 1024
+never does, the chunk size is the switch. If both are clean, the auto choice itself is nondeterministic and the next
+step is to log the chunk size it picks.
+
+The first cut of the window trace had a bug that hid exactly this case: it called a window "FULL" only at `accepted >=
+8`, but T never exceeds 6 here, so full acceptance (`accepted == T - 1`) never showed. Fixed in 9373ea9 (the flag is
+`T > 1 && a == T - 1`).
 
 **Controls** (`python bench/arms/make_arms_k22.py`, one change each against `k22ctx32k`, every one of them carrying
 `--max-context 32768`; a first cut forgot that and silently measured the 64K shape. Read them as "did the storm rate
@@ -223,13 +244,20 @@ move", never as speed):
 
 | Arm | Change | A change in the rate proves |
 |---|---|---|
-| `k22ctx32kspec1p` | `--spec 2 --spec-min-p 1` | the window shape stays, no draft is offered: the fault is in drafting, not in the window |
+| `k22ctx32kspec1p` | `--spec 2 --spec-min-p 1` | MTP drafting off; note it does NOT stop the suffix drafts (`9 of 9` fired in its storm), so it separates MTP from suffix drafting, not drafting from no drafting |
 | `k22ctx32kspec2` | `--spec 2` | a depth threshold (a full window has to be big enough to be fully accepted) |
+| `k22ctx32kchunk8k` | `--prefill 8192` | one prefill chunk for a 4K prompt: the chunk-size switch |
+| `k22ctx32kchunk1k` | `--prefill 1024` | four chunks: the safe end of the same axis |
 | `k22ctx32keager` | `STRATA_VERIFY_EAGER=1` | ordering vs data: eager fails as error 40, graphs as a hang |
 | `k22ctx32kkvf16` | `--kv f16` | the KV arena placement matters as much as the dtype |
 | `k22ctx32ksmallcache` | `STRATA_VRAM_FREE_MIB=0,11000` | buffer placement around the 4 GiB line matters |
 | `b580only32k` | B580 only, all 48 layers | the split, the hand-off and the second card are innocent if it still storms |
 | `a770only32k` | A770 only, all 48 layers | ditto, and which stage manufactures it |
+
+**A note on the 23:0x timeline.** Two startup probes (23:07:35, 23:10:39) and a third at 23:09:34 (visible at line 254
+of `strata-arm-k22ctx32k.log`) ran while the ladder was starting, so any early-session failure in that window is a probe
+collision, not arm behavior. The two storm sessions started at 23:15:25 and 23:36, after the probes were killed, and
+their results stand. Do not probe a config while a round may be running.
 
 `spec1p` and `a770only32k` were brought up once each in a bounded startup probe (75 s, then killed): the first filled a
 7.10 GiB cache, the single-card A770 arm filled 7.83 GiB from 5818 experts, so both are valid configs, not just valid
@@ -251,14 +279,15 @@ window trace on in their own env block, so nothing has to be set by hand):
 
 **Recipe:**
 ```
+set BENCH_SUITES=4K
 set BENCH_RUNS=6
-BENCH-ARMS.bat k22ctx32k k22ctx32kspec1p
+set BENCH_REPEATS=3
+BENCH-ARMS.bat k22ctx32kchunk1k k22ctx32kchunk8k
 ```
-One reference session plus one control is enough to read the first answer (the 32K shape ignites in its first chat run),
-then add `k22ctx32kkvf16` and `a770only32k`. `BENCH_RUNS` raises the runs inside a session for more ignition chances;
-`BENCH_TRACE=1` adds the deferred non-finite scan on top of the window trace. Read the gate verdict in
-`bench\results\arms\...`, then `python tools\arms_logscan.py strata-arm-k22ctx32k.log`, then the window trace lines in
-the same log.
+`BENCH_SUITES=4K` runs only the phase that now ignites (a session reaches it in about 3 minutes instead of 9), and
+`BENCH_RUNS` raises the repetitions inside it. `BENCH_TRACE` is not needed: the fault arms already carry both
+instruments. Read the gate verdict in `bench\results\arms\...`, then the window trace and any `strata dbg:` non-finite
+line in the same log.
 
 ## Speed (no MTP)
 
