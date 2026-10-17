@@ -1,0 +1,45 @@
+#version 450
+
+// vulkan/shaders/noop.comp - the one shader this port builds in Phase 1, and what it is for.
+//
+// It exists so that the SPIR-V path has a body to be built from: vulkan/CMakeLists.txt runs glslc over this file into
+// build-vulkan/spv/noop.spv and tools/embed_spv.py over that into generated/vulkan_shaders/noop.h, which
+// vulkan/src/gpu/runtime.cpp feeds to vkCreateShaderModule and vkCreateComputePipelines for each Arc it opened.  That
+// is the whole pipeline Phase 2 will run engine kernels through, checked on the real card before any engine kernel
+// exists (the engine's entry points are still the 281 generated stubs in vulkan/src/engine/stubs.cpp).
+//
+// Read the body: there is no loop, no counter, no `while`, no atomic, and no buffer this shader re-reads waiting for
+// the host to change it.  That is deliberate, not laziness.  Phase 0 P5 (bench/results/vulkan-caps-2026-10-17.md,
+// "P5 host doorbell") measured on this driver that a `coherent volatile` flag written by the host was NEVER observed
+// by a dispatch already running - not in HOST_VISIBLE, not in HOST_COHERENT, not in a device-local host-visible type,
+// not with the write done before or after the submit.  A shader that polls a host-written flag is therefore not a
+// mechanism this port may use, and the two mechanisms it uses instead - a submit to make host work visible to the GPU
+// (strata::gpu::nudge_submit) and a timeline semaphore value to make GPU progress visible to the host
+// (strata::gpu::wait_timeline) - are both in vulkan/src/gpu/runtime.cpp.  The instrument that measured P5 is
+// vulkan/probe/shaders/spin.comp, and it stays in the probe: it is a measurement, not something this runtime dispatches.
+//
+// Nothing in Phase 1 dispatches this shader.  Building the pipeline is the test; the dispatch of it is not needed for
+// that, and no engine work is faked by it.
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+// The parameter block a CUDA launch's arguments become (runtime.cpp: push constants up to
+// maxPushConstantsSize, which the self-check measures as 256 B on both Arcs).
+layout(push_constant) uniform Push {
+    uint tag;
+    uint lane_mask;
+} pc;
+
+// One storage binding: the shape every device-address argument of an engine kernel becomes (runtime.cpp's
+// record_dispatch writes one VkDescriptorBufferInfo per uint64 in the parameter block, offset from that span, range
+// clamped to min(maxStorageBufferRange, maxBufferSize, maxMemoryAllocationSize)).
+layout(set = 0, binding = 0) buffer Sink {
+    uint value[];
+} sink;
+
+void main() {
+    // A single write, derived from the push constants and this invocation's subgroup lane.  It proves a dispatch can
+    // read its parameter block and write its storage buffer on this driver; it is not a kernel, and it is never run.
+    sink.value[0] = pc.tag ^ (gl_SubgroupSize * 65536u + pc.lane_mask);
+}
