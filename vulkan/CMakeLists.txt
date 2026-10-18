@@ -808,7 +808,7 @@ endif()
 # the sum) in rms_norm and the rows=2 case with a null weight vector, embedding_gather's bit extraction with a code
 # bias, and it calls strata::kernels::dequant_bf16 last.  It is compiled unchanged and unlinked from
 # strata_vulkan_harness on purpose: that library already contains this file's main().
-add_executable(strata_parity_elementwise ../src/kernels/elementwise_parity.cpp)
+add_executable(strata_parity_elementwise ../src/kernels/elementwise_parity.cpp probe/unbuffered_init.cpp)
 target_include_directories(strata_parity_elementwise PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include/vulkan_compat
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -822,6 +822,39 @@ else()
   target_compile_options(strata_parity_elementwise PRIVATE -Wall)
 endif()
 
+# vk_capture_probe: the capture / instantiate / replay / sync path with no compute kernel in it, which is where
+# strata_parity_elementwise.exe stopped and the Intel driver had to be restarted.  Every step is printed unbuffered
+# before it is taken, so a process killed by a timeout still names the call it was blocked in.
+add_executable(vk_capture_probe probe/vk_capture_probe.cpp)
+target_include_directories(vk_capture_probe PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/vulkan_compat
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${STRATA_ROOT}/include
+  ${S}/core
+  ${STRATA_ROOT}/third_party/ggml)
+target_link_libraries(vk_capture_probe PRIVATE strata_gpu_vulkan Vulkan::Vulkan)
+if(MSVC)
+  target_compile_options(vk_capture_probe PRIVATE /utf-8 /EHsc /W3 /FC)
+else()
+  target_compile_options(vk_capture_probe PRIVATE -Wall)
+endif()
+
+# vk_norm_probe: the two cases the shared elementwise driver reports as wrong, on inputs small enough to print every
+# element.  The driver's 24 x 256 fixture says how far off the answer is; this says which part moved.
+add_executable(vk_norm_probe probe/vk_norm_probe.cpp)
+target_include_directories(vk_norm_probe PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/vulkan_compat
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${STRATA_ROOT}/include
+  ${S}/core
+  ${STRATA_ROOT}/third_party/ggml)
+target_link_libraries(vk_norm_probe PRIVATE strata_gpu_vulkan Vulkan::Vulkan)
+if(MSVC)
+  target_compile_options(vk_norm_probe PRIVATE /utf-8 /EHsc /W3 /FC)
+else()
+  target_compile_options(vk_norm_probe PRIVATE -Wall)
+endif()
+
 # STRATA_VULKAN_ENGINE=OFF: the targets are configured - they exist, `--target strata` still works - but they are out
 # of the default build.  That is what keeps start-vulkan-probe.bat (build-vulkan-probe, cached OFF, builds every
 # default target) building the probe and its shaders and nothing else, while the plain configure of this directory
@@ -831,7 +864,7 @@ if(NOT STRATA_VULKAN_ENGINE)
                  "engine's shader target are configured but EXCLUDE_FROM_ALL (the default build stays the Phase 0 "
                  "probe and its own shaders; --target strata still works in this build dir)")
   foreach(strata_engine_target IN ITEMS strata strata_gpu_vulkan strata_vulkan_host strata_vulkan_harness stub_probe
-                                        strata-device strata_vk_smoke strata_vk_parity strata_parity_elementwise
+                                        strata-device strata_vk_smoke strata_vk_parity strata_parity_elementwise vk_norm_probe vk_capture_probe
                                          vulkan_engine_shaders)
     set_target_properties(${strata_engine_target} PROPERTIES EXCLUDE_FROM_ALL TRUE)
   endforeach()
