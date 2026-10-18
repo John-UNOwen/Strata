@@ -193,7 +193,7 @@ void add_inplace(float* dst, const float* src, int64_t n, void* stream) {
 // word i at binding p.param_binding + (p.push_params ? 0 : 1) + i.
 namespace {
 
-constexpr unsigned kNormThreads = 128;             // elementwise.cu:456 launches 4 warps (4 rows) to a block
+constexpr unsigned kNormThreads = 128;             // elementwise_rms_norm.comp: one row per 128-lane workgroup
 
 // vkCreateShaderModule wants whole 32-bit words and embed_spv.py emits bytes.  PipelineSpec.spv is read when the
 // pipeline is built and has to outlive the call, so the words are kept here for the life of the process.
@@ -372,7 +372,7 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
     // and the shader's has_w flag is what keeps it unread.
     const NormArgs args{(uint64_t) (uintptr_t) x, (uint64_t) (uintptr_t) (w != nullptr ? w : x), rows, cols, eps,
                         (uint32_t) (w != nullptr ? 1u : 0u), (uint64_t) (uintptr_t) stream};
-    const unsigned grid = (unsigned) ((rows + 3) / 4);        // four rows to a workgroup, as CUDA's 4 warps
+    const unsigned grid = (unsigned) rows;                  // one workgroup per row, so no row guard and no rounding up
     if (!dispatched_ok("rms_norm_weighted", dispatch("rms_norm_weighted", grid, kNormThreads, &args, sizeof args,
                                                      stream), stream, rows * cols)) return;
 }
