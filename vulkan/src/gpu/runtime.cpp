@@ -883,8 +883,20 @@ void unregister_alloc(Alloc* a) {
     }
 }
 
+void nudge_submit(StreamImpl* s);
+Error wait_timeline(Device& d, VkSemaphore sem, uint64_t value, const char* what);
+
 void destroy_alloc(Device& d, Alloc* a) {
     if (a == nullptr) return;
+    // Giving memory back first waits until every stream of this device has retired what it submitted.  Nothing here
+    // tracks which submit touched which buffer, and freeing memory an in-flight command buffer still names is how a
+    // queue stops retiring work: the submit never finishes, its timeline signal never lands, and wait_timeline below
+    // retries VK_TIMEOUT with no end.  The cheaper rule (an in-flight count per allocation, drained when its fence
+    // signals) is the follow-up; a free is rare next to the compute around it.
+    for (auto& s : d.streams) {
+        nudge_submit(s.get());
+        wait_timeline(d, s->tl, s->signaled, "cudaFree");
+    }
     unregister_alloc(a);
     auto it = std::find_if(d.allocs.begin(), d.allocs.end(),
                            [&](const std::unique_ptr<Alloc>& x) { return x.get() == a; });
