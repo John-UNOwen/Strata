@@ -392,6 +392,46 @@ Of the 280 entry points the Vulkan link currently stubs, 224 are `strata::kernel
 `strata::prefill::*`, 7 `strata::prefill::Gemm::*` and 12 `strata::core::RemoteExpertOpt` methods.
 
 
+## Phase 2 progress (2026-10-18): the elementwise family, and two bugs that froze the driver
+
+Eight bodies are linked and measured against the repo's own driver, `src/kernels/elementwise_parity.cpp` built
+unchanged as `strata_parity_elementwise.exe`. That file is the contract, not a Vulkan-side test written for it.
+
+    gdn_gate rel 3.866e-08                         silu rel 3.517e-08
+    scale_inplace 0 of 1024 exact                  f32_to_f16_bulk 0 of 1024 vs kernels::f16_from_f16
+    rms_norm_weighted rel 3.806e-08 worst 1.660e-07 nonfinite 0 (the driver's gate is rel < 1e-6)
+    rms_norm_weighted with a null weight 0 of 6144
+    f32_to_bf16_bulk 0 of 4096 vs ggml, NaN inputs kept
+    dequant_bf16 (Q8_0) 0 of 64 wrong, and 0 of 128 in the four-block probe with a NaN scale and an infinity scale
+    embedding_gather: refused, see finding 5.  The driver ends with "elementwise: 1 failures"
+
+Findings, in the order they bit us.
+
+1. **`cudaFree` of memory an in-flight command buffer still names wedges the Intel driver.** Two PC freezes came
+   from this. The queue stops retiring work, the submit's timeline signal never lands, and the runtime's
+   `wait_timeline` retries `VK_TIMEOUT` with no end, so the host blocks and even `taskkill` blocks. Fixed in
+   `83032399`: `destroy_alloc` now nudges every stream of the device and waits its timeline before giving the memory
+   back. The cheaper rule (an in-flight count per allocation, drained when its fence signals) is still owed.
+2. **A `while` loop whose exit depends on a GPU approximation can never exit.** The Q8_0 kernel's exponent
+   correction had `while (exp2(float(e)) > a) --e;` and wedged a workgroup on a 136 byte input. Reproduced in
+   `vulkan/probe/vk_norm_probe.exe` with GPU usage at the desktop baseline, so it was never a VRAM problem. Rule for
+   this port: bounded correction steps, never an unbounded loop over an approximation (`3f6a5e08`).
+3. **Never assume a subgroup size.** A hardcoded 32-lane stride over the columns read half a row and gave
+   rel 7.652e-01. `elementwise_rms_norm.comp` is now one 128-lane workgroup per row with a shared-memory tree
+   reduction, which does not care what the driver chose, and has no row guard at all (`79ed63fb`).
+4. **GLSL cannot classify a NaN reliably.** The `v != v` test was folded away and a NaN-scale Q8_0 block came back
+   as `0x4000`, a plain 2.0. Classify on the integer exponent and mantissa fields instead.
+5. **An interior pointer cannot be a storage binding.** A descriptor offset must be a multiple of
+   `minStorageBufferOffsetAlignment` (64 here) and upstream passes `out + 1` and `dc + row * row_bytes`, offsets like
+   16777988. The runtime refuses them and says so; that is the one remaining elementwise failure (207360 mismatches
+   because nothing was ever written). Candidate answer: `VK_KHR_buffer_device_address` with `GL_EXT_buffer_reference`
+   (gate 0 recorded "buffer device address yes" on both cards). This decision belongs before the QSA, KV and rope
+   kernels, which are full of interior pointers.
+6. **`vulkan/tools/run_guarded.ps1` arms a detached kill before the process starts**, so a wedged test dies at the
+   deadline even when the calling shell is blocked. Use it for every GPU run on this branch. The capture path is
+   cleared by `vulkan/probe/vk_capture_probe.cpp` cases A to F (empty capture, a refused kernel inside a capture, 108
+   rounds of refusals then a capture, an interior-pointer refusal plain and inside a capture: all clean).
+
 ## Rough sizes (for planning, not commitments)
 
 | Phase | Work | Comparable |
