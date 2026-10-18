@@ -1,18 +1,20 @@
 #version 450
 
 // vulkan/shaders/elementwise_dequant_bf16.comp - strata::kernels::dequant_bf16 for the Q8_0 block (ggml type 8):
-// 32 signed bytes and an FP16 scale, 34 bytes per block, value = d * (float) q.  One invocation per block, matching
-// the CUDA side's "one thread per 32-element group" (src/kernels/cuda/dequant_bf16.cu's geometry table gives Q8_0
-// 32 elements and 34 bytes).
+// a 2-byte FP16 scale then 32 signed bytes, 34 bytes per block, value = d * (float) q.  One invocation per block,
+// matching the CUDA side's "one thread per 32-element group" (src/kernels/cuda/dequant_bf16.cu:308 gives Q8_0 32
+// elements and 34 bytes).
 //
-// Two things here need bits rather than values, and GLSL has no reinterpret, so the shader does them the long way
-// on purpose:
-//   - the FP16 scale is read as two bytes and turned into a value arithmetically (mantissa * 2^exponent).  Every
-//     fp16 value is exact in f32, and inf and NaN are produced as inf and inf-minus-inf rather than as bit patterns.
-//   - the product has to be rounded to BF16, which needs its f32 bits.  So the product is written through the float
-//     view of a scratch buffer (binding 1) and read back through the uint view of the SAME allocation (binding 2)
-//     with a buffer memory barrier between, which gives bf16_bits the pattern the CUDA helper inspects.  A NaN scale
-//     therefore stays a NaN in BF16 instead of carrying out of the rounding add into -0 or +inf.
+// The first version of this file wrote each product through a float view of a scratch buffer and read it back through
+// a uint view of the SAME allocation to get at the bits, because GLSL cannot reinterpret a float.  That produced
+// numbers that were neither the products nor zero (vk_norm_probe: q 1 and 2 came back 0x0000, q 3 came back 0x3c04),
+// which is what an aliasing pair the compiler never knows about looks like.  This version rounds to BF16 BY VALUE:
+// log2 and exp2 put the magnitude in [128, 256), one rounding step with an explicit round-to-nearest-even tie case,
+// and the exponent and mantissa are then assembled as bits.  No scratch, no aliasing, one buffer for the output.
+//
+// The FP16 scale is decoded the same way, by value: mantissa times a power of two.  Every finite fp16 value is exact
+// in f32.  inf and NaN are recognised on their exponent and mantissa fields and produced as an infinity and a NaN, so
+// the driver's Q8_0-with-a-NaN-scale case still ends up a NaN in BF16 rather than -0 or +inf.
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_ARB_gpu_shader_int64 : require
 
@@ -20,21 +22,18 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Push {
     uint64_t blocks;
-    uint64_t scratch;
-    uint64_t scratch_bits;
     uint64_t out_ptr;
-    int64_t  blocks_per_row;                            // cols / block_elems
-    int64_t  total_blocks;                              // rows * blocks_per_row
-    int64_t  block_first_byte;                          // (row0 * blocks_per_row) * block_bytes
-    int      block_bytes;                               // 34 for Q8_0
-    int      block_elems;                               // 32 for Q8_0
+    int64_t  total_blocks;
+    int64_t  block_first_byte;                            // (row0 * blocks_per_row) * block_bytes
+    int      block_bytes;                                 // 34 for Q8_0
+    int      block_elems;                                 // 32 for Q8_0
+    int      pad0;
+    int      pad1;
     uint64_t stream;
 } pc;
 
 layout(set = 0, binding = 0) buffer Blocks { uint b[]; } bb;
-layout(set = 0, binding = 1) buffer ScratchF { float v[]; } sf;
-layout(set = 0, binding = 2) buffer ScratchU { uint w[]; } su;
-layout(set = 0, binding = 3) buffer Out { uint w[]; } yb;
+layout(set = 0, binding = 1) buffer Out { uint w[]; } yb;
 
 uint byte_at(uint base_byte, uint off) {
     const uint at = base_byte + off;
@@ -43,8 +42,8 @@ uint byte_at(uint base_byte, uint off) {
 
 int int8_of(uint byte) { return int(byte) >= 128 ? int(byte) - 256 : int(byte); }
 
-// f16_bits.hpp's f32_from_f16, by value instead of by bits: exact for every finite fp16, and the special cases
-// produce an actual infinity and an actual NaN.
+// f16_bits.hpp's f32_from_f16, by value: exact for every finite fp16, and the special cases come out as a real
+// infinity and a real NaN.
 float f16_to_f32(uint h) {
     const bool neg = (h & 0x8000u) != 0u;
     const uint ex = (h >> 10) & 0x1Fu;
@@ -56,11 +55,55 @@ float f16_to_f32(uint h) {
     return neg ? -mag : mag;
 }
 
-// bf16_bits.hpp:37-47, quieted NaN pass-through included.
-uint bf16_bits(uint i) {
-    if ((i & 0x7FFFFFFFu) > 0x7F800000u) return (i >> 16) | 64u;
-    i = (i + ((i >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u;
-    return i >> 16;
+// bf16_from_f32's contract (bf16_bits.hpp:37-47) reached without looking at the float's bits: round to nearest even
+// over the 7 stored mantissa bits, keep the sign, pass a NaN through quieted, saturate a finite overflow to inf.
+// A magnitude below the BF16 normal range becomes the signed zero; this kernel's values come from an fp16 scale times
+// an int8, so they are either ordinary magnitudes or special, never bf16 subnormals.
+uint bf16_bits_of(float v) {
+    if (v != v) return (v < 0.0 ? 0x8000u : 0u) | 0x7F80u | 0x40u;          // quieted NaN
+    const uint sign = v < 0.0 ? 0x8000u : 0u;
+    const float a = abs(v);
+    if (a == 0.0) return sign;
+    if (!(a < 3.39e38)) return sign | 0x7F80u;                              // overflow -> inf
+    int e = clamp(int(floor(log2(a))), -126, 127);
+    // Bounded corrections, never a loop.  A while on a GPU approximation is the likeliest way this kernel froze the
+    // Intel driver: a condition that never turns false wedges the workgroup, the queue never finishes, and the host
+    // waiting on its timeline waits forever.
+    if (exp2(float(e)) > a) e -= 1;
+    if (exp2(float(e)) > a) e -= 1;
+    if (exp2(float(e + 1)) <= a) e += 1;
+    if (exp2(float(e + 1)) <= a) e += 1;
+    if (e < -126) return sign;                                             // underflow to the signed zero
+    const float scale = exp2(float(7 - e));                                // a * scale lands in [128, 256)
+    const float s = a * scale;                                             // exact: scale is a power of two
+    const float fl = floor(s);
+    const float frac = s - fl;
+    float r = fl;
+    if (frac > 0.5f) r = fl + 1.0f;
+    else if (frac == 0.5f) r = (mod(fl, 2.0) == 0.0) ? fl : fl + 1.0f;     // the tie goes to the even one
+    if (r >= 256.0) {                                                      // the carry bumps the exponent
+        r = 128.0;
+        e += 1;
+        if (e > 127) return sign | 0x7F80u;
+    }
+    return sign | (uint(e + 127) << 7) | (uint(int(r) - 128));
+}
+
+// The scale's class, taken off its exponent and mantissa fields as integers.  Classifying a NaN by comparing it
+// (the v != v test above) did not survive this compiler: the NaN-scale block came back as 0x4000, a plain 2.0.
+int f16_kind(uint h) {
+    const uint ex = (h >> 10) & 0x1Fu;
+    if (ex != 31u) return 0;                                              // finite, subnormals included
+    return (h & 0x3FFu) != 0u ? 1 : 2;                                    // 1 a NaN, 2 an infinity
+}
+
+// A NaN scale makes every value a NaN, an infinite scale makes them infinities except where the weight is zero
+// (inf * 0 is a NaN), and a finite scale cannot overflow here: fp16 tops out at 65504 and an int8 at 127.
+uint dequant_value(int kind, uint scale_sign, float d, int q) {
+    const uint qsign = q < 0 ? 0x8000u : 0u;
+    if (kind == 1) return (scale_sign ^ qsign) | 0x7FC0u;
+    if (kind == 2) return q == 0 ? ((scale_sign ^ qsign) | 0x7FC0u) : ((scale_sign ^ qsign) | 0x7F80u);
+    return bf16_bits_of(d * float(q));
 }
 
 void main() {
@@ -70,18 +113,18 @@ void main() {
     if (bi >= int(pc.total_blocks)) return;
 
     const uint blk_byte = uint(pc.block_first_byte) + uint(bi) * uint(pc.block_bytes);
-    const uint scale = byte_at(blk_byte, 32u) | (byte_at(blk_byte, 33u) << 8u);
-    const float d = f16_to_f32(scale);
+    // Q8_0 is a 2-byte FP16 scale FIRST and then the 32 signed bytes (llama.cpp's block_q8_0 is
+    // `{ ggml_half d; int8_t qs[32]; }`, and src/kernels/elementwise_parity.cpp:442 writes its scale at blk[0..1] for
+    // the same reason).  Reading the weights first and the scale last is what made every value here wrong.
+    const uint h = byte_at(blk_byte, 0u) | (byte_at(blk_byte, 1u) << 8u);
+    const int kind = f16_kind(h);
+    const uint scale_sign = h & 0x8000u;
+    const float d = f16_to_f32(h);
 
-    const int out_base = bi * pc.block_elems;            // element index of this block's first value
-    const int sbase = bi * pc.block_elems;               // its scratch slot
-
+    const int out_base = bi * pc.block_elems;               // element index of this block's first value
     for (int t = 0; t < pc.block_elems; t += 2) {
-        sf.v[sbase + t] = d * float(int8_of(byte_at(blk_byte, uint(t))));
-        sf.v[sbase + t + 1] = d * float(int8_of(byte_at(blk_byte, uint(t + 1))));
-        memoryBarrierBuffer();                            // the uint view must see the float view's stores
-        const uint lo = bf16_bits(su.w[sbase + t]);
-        const uint hi = bf16_bits(su.w[sbase + t + 1]);
-        yb.w[(out_base + t) >> 1] = (hi << 16) | lo;     // block_elems is even, so these words are this block's
+        const uint lo = dequant_value(kind, scale_sign, d, int8_of(byte_at(blk_byte, 2u + uint(t))));
+        const uint hi = dequant_value(kind, scale_sign, d, int8_of(byte_at(blk_byte, 2u + uint(t + 1))));
+        yb.w[(out_base + t) >> 1] = (hi << 16) | lo;       // block_elems is even, so these words are this block's
     }
 }

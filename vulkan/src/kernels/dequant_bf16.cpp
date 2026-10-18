@@ -8,11 +8,10 @@
 // the prompt path's quantized-weight GEMMs; src/kernels/elementwise_parity.cpp reaches this one because its last
 // case is a Q8_0 block whose scale is a NaN.
 //
-// The scratch buffer is the shader's bitcast (see vulkan/shaders/elementwise_dequant_bf16.comp): the products have
-// to be read back as bits to be rounded to BF16, so the kernel needs rows*cols floats of device memory in addition
-// to the output.  It is kept for the life of the process and grown when a bigger call comes, rather than allocated
-// and freed per launch: a free right after a launch on a caller's stream would hand back memory the GPU is still
-// reading.  Slicing a large tensor into chunks, so the scratch stays bounded, is the Phase 3 follow-up.
+// The rounding to BF16 happens in the SPIR-V by VALUE (see vulkan/shaders/elementwise_dequant_bf16.comp): GLSL has no
+// float-to-bits reinterpret, and the first attempt at that - binding one allocation as floats in one binding and as
+// uints in another, then reading back what was written - produced values that were neither the products nor zero.
+// This route allocates nothing but the output the caller passed.
 #include "strata/kernels/dequant_bf16.hpp"
 
 #include "strata/gpu/runtime.hpp"
@@ -39,53 +38,21 @@ constexpr unsigned kThreads = 256;                  // elementwise.cu's THREADS,
 constexpr int kQ8Elems = 32;                        // geometry(8): 32 elements
 constexpr int kQ8Bytes = 34;                        // geometry(8): 34 bytes per block
 
-// The .comp's push block, field for field.  Words 0..3 are the storage bindings in that order: blocks, the scratch
-// seen as floats, the same scratch seen as uints, and the output.  The scratch is bound twice because GLSL cannot
-// reinterpret a float as its bits, and record_dispatch binds word i at binding i.
+// The .comp's push block, field for field.  Words 0..1 are the storage bindings in that order (blocks, then the
+// output), because record_dispatch binds word i at binding i.
 struct DeqArgs {
     uint64_t blocks;
-    uint64_t scratch;
-    uint64_t scratch_bits;
     uint64_t out;
-    int64_t blocks_per_row;
     int64_t total_blocks;
     int64_t block_first_byte;
     int32_t block_bytes;
     int32_t block_elems;
+    int32_t pad0;
+    int32_t pad1;
     uint64_t stream;
 };
 
-static_assert(sizeof(DeqArgs) == 72, "DeqArgs must match elementwise_dequant_bf16.comp's push block");
-
-// The process-wide scratch, grown on demand.  0 while never allocated.
-uint64_t g_scratch_addr = 0;
-int64_t g_scratch_bytes = 0;
-
-bool scratch_ready(int64_t bytes) {
-    if (bytes <= g_scratch_bytes) return true;
-    if (g_scratch_addr != 0) {
-        const cudaError_t f = cudaFree((void*) (uintptr_t) g_scratch_addr);
-        if (f != cudaSuccess) {
-            std::fprintf(stderr, "strata vulkan: dequant_bf16: cudaFree of the %lld byte scratch said %s.  The old "
-                                 "scratch stays in place and this call is refused.\n", (long long) g_scratch_bytes,
-                         cudaGetErrorString(f));
-            return false;
-        }
-        g_scratch_addr = 0;
-        g_scratch_bytes = 0;
-    }
-    void* p = nullptr;
-    const cudaError_t e = cudaMalloc(&p, (size_t) bytes);
-    if (e != cudaSuccess || p == nullptr) {
-        std::fprintf(stderr, "strata vulkan: dequant_bf16: cudaMalloc of %lld scratch bytes said %s.  The scratch is "
-                             "rows x cols floats, so this is the dequant of a big tensor needing a chunked call.\n",
-                     (long long) bytes, cudaGetErrorString(e));
-        return false;
-    }
-    g_scratch_addr = (uint64_t) (uintptr_t) p;
-    g_scratch_bytes = bytes;
-    return true;
-}
+static_assert(sizeof(DeqArgs) == 56, "DeqArgs must match elementwise_dequant_bf16.comp's push block");
 
 int g_pipeline_state = 0;                            // 0 never tried, 1 registered, 2 refused
 
@@ -112,8 +79,8 @@ bool pipeline_registered() {
     spec.spv_words = words.size();
     spec.workgroup = gpu::Dim3{kThreads, 1, 1};
     spec.shared_mem = 0;
-    spec.param_bytes = sizeof(DeqArgs);              // 72 B, well under this card's 256 B push limit
-    spec.storage_bindings = 4;                       // blocks, scratch as floats, scratch as uints, out
+    spec.param_bytes = sizeof(DeqArgs);              // 56 B, well under this card's 256 B push limit
+    spec.storage_bindings = 2;                       // blocks, then the output
     const gpu::Error e = gpu::register_pipeline(spec);
     if (e != gpu::kSuccess) {
         std::fprintf(stderr, "strata vulkan: dequant_bf16: register_pipeline(\"%s\") said %s (%s).  This entry point "
@@ -151,18 +118,15 @@ void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows,
 
     const int64_t blocks_per_row = cols / kQ8Elems;
     const int64_t total_blocks = rows * blocks_per_row;
-    if (!scratch_ready(total_blocks * kQ8Elems * 4)) return;  // the reason is already on stderr
-
     const DeqArgs args{
         (uint64_t) (uintptr_t) blocks,
-        g_scratch_addr,
-        g_scratch_addr,                                    // the same allocation, the other view of it
         (uint64_t) (uintptr_t) out,
-        blocks_per_row,
         total_blocks,
         row0 * blocks_per_row * kQ8Bytes,
         (int32_t) kQ8Bytes,
         (int32_t) kQ8Elems,
+        0,                                             // pad0, the .comp's field for field
+        0,                                             // pad1
         (uint64_t) (uintptr_t) stream,
     };
 
